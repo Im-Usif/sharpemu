@@ -202,6 +202,7 @@ public enum SpirvCapability : uint
     Float64 = 10,
     Int64 = 11,
     Int64Atomics = 12,
+    Int64ImageExt = 5016,
     Int16 = 22,
     ImageGatherExtended = 25,
     StorageImageExtendedFormats = 49,
@@ -353,6 +354,7 @@ public enum SpirvImageFormat : uint
     Rg8ui = 37,
     R16ui = 38,
     R8ui = 39,
+    R64ui = 40,
 }
 
 public sealed class SpirvModuleBuilder
