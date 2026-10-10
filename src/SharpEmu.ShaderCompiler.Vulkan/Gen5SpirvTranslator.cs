@@ -77,6 +77,7 @@ public static partial class Gen5SpirvTranslator
         private bool _guestLaneFromSubgroup;
         private readonly bool _hasIndirectControlFlow;
         private readonly Dictionary<uint, Dictionary<uint, uint>> _savedLaneValues = new();
+        private readonly bool _usesBufferAtomics;
 
         // Safety valve for the PC-dispatcher loop. Each iteration executes one
         // GCN basic block; a correctly-translated shader always reaches its

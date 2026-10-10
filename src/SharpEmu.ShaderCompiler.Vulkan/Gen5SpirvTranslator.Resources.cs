@@ -133,6 +133,9 @@ public static partial class Gen5SpirvTranslator
             _request = request;
             _hasIndirectControlFlow = request.Program.Instructions.Any(
                 static instruction => instruction.Opcode is "SSetpcB64" or "SSwappcB64");
+            _usesBufferAtomics = request.Program.Instructions.Any(static instruction =>
+                instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("GlobalAtomic", StringComparison.Ordinal));
             _stage = request.Stage switch
             {
                 ShaderStage.Vertex => Gen5SpirvStage.Vertex,
@@ -344,6 +347,13 @@ public static partial class Gen5SpirvTranslator
             _module.AddName(_globalBuffers, "guestBuffers");
             _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, bindingNumber);
+            if (_usesBufferAtomics)
+            {
+                // A program with buffer atomics communicates through guest memory with its other thread groups, so its plain loads
+                // must see their stores and not a cached line from before them.
+                _module.AddDecoration(_globalBuffers, SpirvDecoration.Coherent);
+            }
+
             _interfaces.Add(_globalBuffers);
         }
 
