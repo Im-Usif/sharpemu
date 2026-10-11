@@ -293,13 +293,18 @@ public sealed partial class GuestImageCache
         return true;
     }
 
+    // A block-compressed image states its pitch and height in texels, and the uncompressed view of its blocks states them in blocks,
+    // so a side that is compressed is compared in blocks.
     private static bool SameMipLayout(in ImageDescription left, in ImageDescription right)
     {
+        var leftShift = left.IsBlock ? 2 : 0;
+        var rightShift = right.IsBlock ? 2 : 0;
         for (var level = 0; level < ImageDescription.MaxLevels; level++)
         {
             var a = left.MipLayout[level];
             var b = right.MipLayout[level];
-            if (a.Offset != b.Offset || a.Size != b.Size || a.Pitch != b.Pitch || a.Height != b.Height)
+            if (a.Offset != b.Offset || a.Size != b.Size || (a.Pitch >> leftShift) != (b.Pitch >> rightShift) ||
+                (a.Height >> leftShift) != (b.Height >> rightShift))
             {
                 return false;
             }
