@@ -3792,6 +3792,27 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode is "SBitcmp0B64" or "SBitcmp1B64")
+            {
+                // The 64-bit value is the first source; only the low six bits
+                // of the second one pick the bit.
+                var selected = ShiftLeftLogical64(
+                    _module.Constant64(_ulongType, 1),
+                    Widen(BitwiseAnd(GetRawSource(instruction, 1), UInt(63))));
+                var isSet = IsNotZero64(
+                    _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        GetRawSource64(instruction, 0),
+                        selected));
+                Store(
+                    _scc,
+                    instruction.Opcode == "SBitcmp1B64"
+                        ? isSet
+                        : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, isSet));
+                return true;
+            }
+
             var left = GetRawSource(instruction, 0);
             var right = GetRawSource(instruction, 1);
             if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32")
