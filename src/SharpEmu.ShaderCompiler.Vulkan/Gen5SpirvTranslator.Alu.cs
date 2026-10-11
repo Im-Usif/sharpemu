@@ -895,8 +895,9 @@ public static partial class Gen5SpirvTranslator
                 case "VDot2cF32F16":
                 {
                     // The two packed half pairs are widened before the
-                    // products are accumulated in f32.  The c form clamps
-                    // the final dot product to the normalized [0, 1] range.
+                    // products are accumulated in f32 on top of the previous
+                    // value of the destination.  Only the clamp of the
+                    // encoding limits the result.
                     var left = GetRawSource(instruction, 0);
                     var right = GetRawSource(instruction, 1);
                     var lowProduct = _module.AddInstruction(
@@ -912,7 +913,11 @@ public static partial class Gen5SpirvTranslator
                     var dot = _module.AddInstruction(SpirvOp.FAdd, _floatType, lowProduct, highProduct);
                     result = EmitFloatResult(
                         instruction,
-                        Bitcast(_floatType, EmitClampToUnitInterval(Bitcast(_uintType, dot))));
+                        _module.AddInstruction(
+                            SpirvOp.FAdd,
+                            _floatType,
+                            dot,
+                            Bitcast(_floatType, LoadV(destination))));
                     break;
                 }
                 case "VMax3F16":
