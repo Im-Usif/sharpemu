@@ -518,6 +518,50 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A layer that a texture grew into a mip chain is still looked up as a one-level color target every frame. Its metadata slice lies outside
+    // the image's range or, as in a packed allocation, inside it behind the first level.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DccClear_ReachesAOneLevelColorTargetOfAnImageThatHasAMipChain(bool metadataInsideTheImage)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var imageAddress = address + 0x1000;
+        var metadataAddress = address + (metadataInsideTheImage ? 0x3000UL : 0x10000UL);
+        var secondLevelOffset = metadataInsideTheImage ? 0x4000UL : 32UL;
+        const ulong metadataSliceSize = 0x1000;
+        // 0x40 is the fast-clear code of (0, 0, 0, 1).
+        harness.Write(metadataAddress, Enumerable.Repeat((byte)0x40, (int)metadataSliceSize).ToArray());
+
+        var chain = LinearRequest(imageAddress, secondLevelOffset + 8, Format.R16G16B16A16Sfloat, GuestPixelFormat.Bits16_16_16_16Float, GuestImageType.Color2D, new Extent3D(2, 2, 1), 1, 8, 1);
+        chain.Description.Resources = new SubresourceCount(2, 1);
+        chain.Description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = 32, Pitch = 2, Height = 2 };
+        chain.Description.MipLayout[1] = new MipLevelLayout { Offset = secondLevelOffset, Size = 8, Pitch = 1, Height = 1 };
+        chain.View = chain.View with { LevelCount = 2 };
+        var chainId = harness.Find(ref chain);
+
+        var target = AsColorTarget(chain);
+        target.Description.Resources = new SubresourceCount(1, 1);
+        target.View = target.View with { LevelCount = 1 };
+        target.Description.Metadata.Kind = MetadataKind.Dcc;
+        target.Description.Metadata.Range = new GuestSpan(metadataAddress, metadataSliceSize);
+        target.Description.Metadata.DccAlphaMsb = true;
+        var targetId = harness.Find(ref target);
+        Assert.Equal(chainId, targetId);
+
+        // The fill that consumes the code is the emulator's own write to the metadata slice; the image it has just cleared keeps its contents.
+        Assert.False(harness.Image(targetId).IsBufferModified);
+        var local = target;
+        harness.Worker.Run(() => harness.Images.AcquireColorTargetView(targetId, local));
+        harness.Finish();
+
+        var opaqueBlack = Enumerable.Range(0, 4).SelectMany(_ => new byte[] { 0, 0, 0, 0, 0, 0, 0, 0x3c }).ToArray();
+        Assert.Equal(opaqueBlack, harness.ReadImageBytes(harness.Image(targetId)));
+        harness.Shutdown();
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

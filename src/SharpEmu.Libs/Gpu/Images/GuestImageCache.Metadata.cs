@@ -41,8 +41,8 @@ public sealed partial class GuestImageCache
             }
 
             image.Description.Metadata = description.Metadata;
-            if (range.Size == 0 || description.Resources.Levels != 1 ||
-                image.Description.Resources.Levels != 1)
+            // The request decides: a one-level view of an image that a texture grew into a mip chain still takes its fast clear on that level.
+            if (range.Size == 0 || description.Resources.Levels != 1)
             {
                 return;
             }
@@ -142,6 +142,13 @@ public sealed partial class GuestImageCache
 
                 Interlocked.Increment(ref _dccSlicesCleared);
 
+                // The fill that consumes the code is a GPU write into the surface's allocation. When the image's range covers the metadata it marks the image stale,
+                // so it comes first: the clear, which takes the ownership, has the last word.
+                if (request.Role != ImageRole.DisplaySurface)
+                {
+                    _bufferCache.FillBuffer(address, sliceSize, uint.MaxValue, isGds: false);
+                }
+
                 using (var held = _lock.Hold())
                 {
                     if (_slots.TryGet(imageIdentifier) == null)
@@ -154,11 +161,6 @@ public sealed partial class GuestImageCache
                         request,
                         new SubresourceRange(view.BaseLevel, view.LevelCount, imageFirst + slice, 1),
                         clear);
-                }
-
-                if (request.Role != ImageRole.DisplaySurface)
-                {
-                    _bufferCache.FillBuffer(address, sliceSize, uint.MaxValue, isGds: false);
                 }
             }
         }
