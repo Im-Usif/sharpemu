@@ -1295,7 +1295,38 @@ public sealed partial class ResourceTracker
         !_readsByMemory.TryGetValue(index, out var readers) || readers.All(reader => ReferenceEquals(reader, owner));
 
     private bool UsesOnly(ScalarValue value, IReadOnlyList<ScalarValue> users) =>
-        _uses.TryGetValue(value, out var uses) && uses.Count != 0 && uses.All(user => users.Any(candidate => ReferenceEquals(candidate, user)));
+        UsesOnlyThroughInvariantPhis(value, value, users, []);
+
+    // A phi that only merges the value with itself forwards it, so its users are the value's users.
+    private bool UsesOnlyThroughInvariantPhis(ScalarValue origin, ScalarValue value, IReadOnlyList<ScalarValue> users, HashSet<ScalarValue> visited)
+    {
+        if (!_uses.TryGetValue(value, out var uses) || uses.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (var user in uses)
+        {
+            if (users.Any(candidate => ReferenceEquals(candidate, user)))
+            {
+                continue;
+            }
+
+            if (user.Kind != ScalarValueKind.Phi || !ReferenceEquals(_graph.ResolveInvariantPhi(user), origin))
+            {
+                return false;
+            }
+
+            if (visited.Add(user) && !UsesOnlyThroughInvariantPhis(origin, user, users, visited))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private ScalarValue Invariant(ScalarValue value) => _graph.ResolveInvariantPhi(value) ?? value;
 
     private bool MakeRuntimeBufferSource(ScalarValue handle, uint pc, out uint sourceIndex, out DescriptorSource source)
     {
@@ -1378,7 +1409,7 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        return stride != 0 && selector.Kind == ScalarValueKind.FirstLane;
+        return stride != 0;
     }
 
     // A material-table key selects a heap record whose eight dwords are the image
@@ -1397,7 +1428,7 @@ public sealed partial class ResourceTracker
         var memoryIndices = new int[8];
         for (var dword = 0; dword < 8; dword++)
         {
-            var read = handle.Operands[dword];
+            var read = Invariant(handle.Operands[dword]);
             heapReads[dword] = read;
             var memory = ScalarReadMemory(read, out var memoryIndex);
             if (memory is null || memory.Offset != (uint)dword * sizeof(uint) || !MemoryIndexBelongsTo(memoryIndex, read))
@@ -1414,9 +1445,9 @@ public sealed partial class ResourceTracker
             heapHandle = currentHandle;
             if (dword == 0)
             {
-                heapOffset = read.Operands[1];
+                heapOffset = Invariant(read.Operands[1]);
             }
-            else if (!_graph.Equivalent(heapOffset!, read.Operands[1]))
+            else if (!_graph.Equivalent(heapOffset!, Invariant(read.Operands[1])))
             {
                 return false;
             }
@@ -1430,7 +1461,7 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        var materialRead = heapOffset.Operands[0];
+        var materialRead = Invariant(heapOffset.Operands[0]);
         var materialMemory = ScalarReadMemory(materialRead, out var materialMemoryIndex);
         if (materialMemory is null || !MemoryIndexBelongsTo(materialMemoryIndex, materialRead))
         {
@@ -1438,7 +1469,14 @@ public sealed partial class ResourceTracker
         }
 
         var materialHandle = materialRead.Operands[0];
-        if (!MatchMaterialOffset(materialRead.Operands[1], out var selector, out var selectorStride, out var selectorOffset))
+        if (!MatchMaterialOffset(Invariant(materialRead.Operands[1]), out var selector, out var selectorStride, out var selectorOffset))
+        {
+            return false;
+        }
+
+        // A selector every lane shares (a loop counter, a user data dword) needs the candidate table only when the host
+        // cannot evaluate the descriptor as one runtime value; otherwise the direct source stays exact.
+        if (selector.Kind != ScalarValueKind.FirstLane && ValidateSource(new DescriptorSource { Dwords = handle.Operands }, out _))
         {
             return false;
         }
