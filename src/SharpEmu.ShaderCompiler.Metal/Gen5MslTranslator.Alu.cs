@@ -706,14 +706,14 @@ public static partial class Gen5MslTranslator
             else if (opcode is
                      "VCmpTruF32" or "VCmpxTruF32" or
                      "VCmpTruF16" or "VCmpxTruF16" or
-                     "VCmpTI32" or "VCmpTU32")
+                     "VCmpTI32" or "VCmpxTI32" or "VCmpTU32" or "VCmpxTU32")
             {
                 condition = "true";
             }
             else if (opcode is
                      "VCmpFF32" or "VCmpxFF32" or
                      "VCmpFF16" or "VCmpxFF16" or
-                     "VCmpFI32" or "VCmpFU32")
+                     "VCmpFI32" or "VCmpxFI32" or "VCmpFU32" or "VCmpxFU32")
             {
                 condition = "false";
             }
