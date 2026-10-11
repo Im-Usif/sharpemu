@@ -307,10 +307,10 @@ public static partial class Gen5MslTranslator
                     $"(({RawSource(instruction, 1)}) - ({RawSource(instruction, 0)}))",
                 "VMulI32I24" =>
                     EmitSignedMultiply24(instruction),
-                // The SPIR-V translator treats the U24 multiply as a full 32-bit
-                // multiply (only the Hi/Mad forms mask); mirror it exactly.
-                "VMulLoU32" or "VMulLoI32" or "VMulU32U24" =>
+                "VMulLoU32" or "VMulLoI32" =>
                     $"(({RawSource(instruction, 0)}) * ({RawSource(instruction, 1)}))",
+                "VMulU32U24" =>
+                    $"((({RawSource(instruction, 0)}) & 0xFFFFFFu) * (({RawSource(instruction, 1)}) & 0xFFFFFFu))",
                 "VMulHiU32" =>
                     $"mulhi({RawSource(instruction, 0)}, {RawSource(instruction, 1)})",
                 "VMulHiU32U24" =>

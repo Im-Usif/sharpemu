@@ -1109,8 +1109,14 @@ public static partial class Gen5SpirvTranslator
                 }
                 case "VMulLoU32":
                 case "VMulLoI32":
-                case "VMulU32U24":
                     result = EmitIntegerBinary(instruction, SpirvOp.IMul);
+                    break;
+                case "VMulU32U24":
+                    result = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(0x00FF_FFFF)),
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(0x00FF_FFFF)));
                     break;
                 case "VMulHiU32":
                 case "VMulHiU32U24":
