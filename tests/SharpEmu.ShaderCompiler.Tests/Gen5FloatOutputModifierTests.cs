@@ -64,4 +64,16 @@ public sealed class Gen5FloatOutputModifierTests
         Assert.Equal(baseline, Count(Metal(Build(Sdwa(6, 0, false))), "0xFFFF0000u"));
         Assert.Equal(baseline + 1, Count(Metal(Build(new Gen5Vop3Control(0, 0, 0, false, 0, null))), "0xFFFF0000u"));
     }
+
+    // The conversions with a 16-bit result write one half of the destination like the 16-bit arithmetic (HalfConversionDeviceTests).
+    [Theory]
+    [InlineData("VCvtU16F16")]
+    [InlineData("VCvtI16F16")]
+    [InlineData("VCvtF16F32")]
+    public void APlainConversionToAHalfKeepsTheHighHalf(string opcode)
+    {
+        var baseline = Count(Metal(Unary("VMovB32", null)), "0xFFFF0000u");
+        Assert.Equal(baseline + 1, Count(Metal(Unary(opcode, null)), "0xFFFF0000u"));
+        Assert.Equal(baseline, Count(Metal(Unary(opcode, Sdwa(6, 0, false))), "0xFFFF0000u"));
+    }
 }

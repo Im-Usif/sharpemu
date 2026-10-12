@@ -48,6 +48,7 @@ public sealed class FloatOutputModifierDeviceTests(HeadlessVulkanFixture fixture
             new Case("mul below zero, low field", "VMulF16", Sdwa(4, 2, clamp: true), HalfMinus2, Half1, 0xDEAD0000),
             new Case("mul inside the range, high field", "VMulF16", Sdwa(5, 2, clamp: true), Half0p5, Half0p5, 0x3400_BEEF),
             new Case("max above one", "VMaxF16", Sdwa(4, 2, clamp: true), Half1p5, Half0p5, 0xDEAD0000 | Half1),
+            new Case("min above one", "VMinF16", Sdwa(4, 2, clamp: true), Half2, Half1p5, 0xDEAD0000 | Half1),
             new Case("sub below zero, dword", "VSubF16", Sdwa(6, 0, clamp: true, source0: 6, source1: 6), Half0p5, Half2, 0));
     }
 
@@ -67,7 +68,8 @@ public sealed class FloatOutputModifierDeviceTests(HeadlessVulkanFixture fixture
         Check(
             new Case("dword select", "VAddF16", Sdwa(6, 0), Half1, Half2, Half3),
             new Case("low field padded", "VAddF16", Sdwa(4, 0), Half1, Half2, Half3),
-            new Case("unary, dword select", "VRcpF16", Sdwa(6, 0), Half2, 0, Half0p5));
+            new Case("unary, dword select", "VRcpF16", Sdwa(6, 0), Half2, 0, Half0p5),
+            new Case("min, dword select", "VMinF16", Sdwa(6, 0), Half1, Half2, Half1));
     }
 
     [Fact]
@@ -95,8 +97,8 @@ public sealed class FloatOutputModifierDeviceTests(HeadlessVulkanFixture fixture
             new Case("u32 to f32, sdwa, times two", "VCvtF32U32", Sdwa(6, 0, 1, false, 6, 6), 4, 0, Bits(8f)),
             new Case("ubyte1 to f32, vop3, times four", "VCvtF32Ubyte1", Modifiers(2, false), 0x300, 0, Bits(12f), Vop3: true),
             new Case("f32 to f16, sdwa, times two", "VCvtF16F32", Sdwa(6, 0, 1, false, 6, 6), Bits(0.75f), 0, Half1p5),
-            new Case("f32 to f16, vop3, clamp", "VCvtF16F32", Modifiers(0, true), Bits(2.5f), 0, Half1, Vop3: true),
-            new Case("f32 to f16, plain", "VCvtF16F32", null, Bits(2.5f), 0, 0x4100));
+            new Case("f32 to f16, vop3, clamp", "VCvtF16F32", Modifiers(0, true), Bits(2.5f), 0, 0xDEAD0000 | Half1, Vop3: true),
+            new Case("f32 to f16, plain", "VCvtF16F32", null, Bits(2.5f), 0, 0xDEAD4100));
     }
 
     private void Check(params Case[] cases)

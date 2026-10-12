@@ -189,9 +189,12 @@ public static partial class Gen5SpirvTranslator
                         Float(0),
                         source);
                     var bounded = Ext(43, _floatType, source, Float(0), Float(65535));
-                    result = BitwiseAnd(
-                        _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded),
-                        UInt(0xFFFF));
+                    result = EmitHalfResult(
+                        instruction,
+                        destination,
+                        BitwiseAnd(
+                            _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded),
+                            UInt(0xFFFF)));
                     break;
                 }
                 case "VCvtF16U16":
@@ -226,11 +229,14 @@ public static partial class Gen5SpirvTranslator
                         Float(0),
                         source);
                     var bounded = Ext(43, _floatType, source, Float(-32768), Float(32767));
-                    result = BitwiseAnd(
-                        Bitcast(
-                            _uintType,
-                            _module.AddInstruction(SpirvOp.ConvertFToS, _intType, bounded)),
-                        UInt(0xFFFF));
+                    result = EmitHalfResult(
+                        instruction,
+                        destination,
+                        BitwiseAnd(
+                            Bitcast(
+                                _uintType,
+                                _module.AddInstruction(SpirvOp.ConvertFToS, _intType, bounded)),
+                            UInt(0xFFFF)));
                     break;
                 }
                 case "VCvtI32F32":
@@ -286,7 +292,10 @@ public static partial class Gen5SpirvTranslator
                         _vec2Type,
                         ApplyOutputModifiers(instruction, GetFloatSource(instruction, 0)),
                         Float(0));
-                    result = BitwiseAnd(Ext(58, _uintType, vector), UInt(0xFFFF));
+                    result = EmitHalfResult(
+                        instruction,
+                        destination,
+                        BitwiseAnd(Ext(58, _uintType, vector), UInt(0xFFFF)));
                     break;
                 }
                 case "VCvtF32F16":
@@ -2480,8 +2489,13 @@ public static partial class Gen5SpirvTranslator
         {
             var bits = MinimumHalfBits(ReadMinimumHalfBits(instruction, 0), ReadMinimumHalfBits(instruction, 1));
             if (ternary) bits = MinimumHalfBits(bits, ReadMinimumHalfBits(instruction, 2));
-            var control = instruction.Control as Gen5Vop3Control;
-            var modifier = _request.IeeeMode ? 0u : control?.OutputModifier ?? 0u;
+            var (outputModifier, clamp) = instruction.Control switch
+            {
+                Gen5Vop3Control vop3 => (vop3.OutputModifier, vop3.Clamp),
+                Gen5SdwaControl sdwa => (sdwa.OutputModifier, sdwa.Clamp),
+                _ => (0u, false),
+            };
+            var modifier = _request.IeeeMode ? 0u : outputModifier;
             if (modifier != 0)
             {
                 var scaled = _module.AddInstruction(SpirvOp.FMul, _floatType,
@@ -2489,16 +2503,14 @@ public static partial class Gen5SpirvTranslator
                 var converted = EmitFloatToHalf(Bitcast(_uintType, scaled));
                 bits = SelectU(UCmp(SpirvOp.UGreaterThan, BitwiseAnd(bits, UInt(0x7FFF)), UInt(0x7C00)), bits, converted);
             }
-            if (control?.Clamp == true)
+            if (clamp)
             {
                 var negative = IsNotZero(BitwiseAnd(bits, UInt(0x8000)));
                 var nan = UCmp(SpirvOp.UGreaterThan, BitwiseAnd(bits, UInt(0x7FFF)), UInt(0x7C00));
                 bits = SelectU(_module.AddInstruction(SpirvOp.LogicalOr, _boolType, negative, nan), UInt(0),
                     SelectU(UCmp(SpirvOp.UGreaterThan, bits, UInt(0x3C00)), UInt(0x3C00), bits));
             }
-            return ((control?.OperandSelect ?? 0) & 8) != 0
-                ? BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF)), ShiftLeftLogical(bits, UInt(16)))
-                : BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF0000)), bits);
+            return EmitHalfResult(instruction, destination, bits);
         }
 
         // Widens an f16 value held in the low 16 bits of `halfBits` to an f32 bit
@@ -5677,16 +5689,24 @@ public static partial class Gen5SpirvTranslator
         private uint EmitFloat16Result(
             Gen5ShaderInstruction instruction,
             uint destination,
-            uint value)
+            uint value) =>
+            EmitHalfResult(instruction, destination, EmitFloatToHalf(EmitFloatResult(instruction, value)));
+
+        // A 16-bit result is one half of the destination register: op_sel names the half and the other one stays. The
+        // conversions to a half and from a half to a 16-bit integer are 16-bit results as well, and compiled code keeps a
+        // second value in the high half across them.
+        private uint EmitHalfResult(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint half)
         {
-            var control = instruction.Control as Gen5Vop3Control;
-            var half = EmitFloatToHalf(EmitFloatResult(instruction, value));
             if (instruction.Control is Gen5SdwaControl)
             {
                 // The SDWA word picks the field that takes the half and what becomes of the rest of the register.
                 return half;
             }
 
+            var control = instruction.Control as Gen5Vop3Control;
             var current = LoadV(destination);
             return ((control?.OperandSelect ?? 0) & 8) != 0
                 ? BitwiseOr(
