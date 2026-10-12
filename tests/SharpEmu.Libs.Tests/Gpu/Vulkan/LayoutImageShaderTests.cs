@@ -112,6 +112,26 @@ public sealed class LayoutImageShaderTests(HeadlessVulkanFixture fixture, ITestO
         return Program([.. instructions]);
     }
 
+    // A gather of the first channel at (u, v) with a level of detail; the four texels go to the result buffer.
+    private static Gen5ShaderProgram GatherAtLevelProgram(float u, float v, float lod)
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0;
+        instructions.AddRange(ImageWords(ref pc, FirstImageRegister, FirstImageAddress, Format32Float, lastLevel: 3));
+        instructions.AddRange(SamplerWords(ref pc, SamplerRegister));
+        instructions.Add(MoveVector(pc, 0, BitConverter.SingleToUInt32Bits(u))); pc += 8;
+        instructions.Add(MoveVector(pc, 1, BitConverter.SingleToUInt32Bits(v))); pc += 8;
+        instructions.Add(MoveVector(pc, 2, BitConverter.SingleToUInt32Bits(lod))); pc += 8;
+        instructions.Add(Image(pc, "ImageGather4L", FirstImageRegister, SamplerRegister, dmask: 1)); pc += 8;
+        for (uint texel = 0; texel < 4; texel++)
+        {
+            instructions.Add(BufferAccess(pc, "BufferStoreDword", ResultRegister, (int)texel * 4, 1, vectorData: 4 + texel)); pc += 8;
+        }
+
+        instructions.Add(EndProgram(pc));
+        return Program([.. instructions]);
+    }
+
     private static ImageDescription Describe(ulong guestOffset, Format format, GuestPixelFormat guestFormat, uint width, uint height, uint levels, uint bytesPerBlock = 4)
     {
         var description = ImageDescription.Create();
@@ -540,6 +560,57 @@ public sealed class LayoutImageShaderTests(HeadlessVulkanFixture fixture, ITestO
         Assert.Equal(0xAAAA_AAAAu, result[3]);
         run.Harness.AssertNoValidationMessages();
         output.WriteLine($"Verified a 64-bit image atomic on {vulkan.DeviceName}; validation={vulkan.ValidationEnabled}.");
+    }
+
+    // An 8x8 image with four levels whose texel (x, y) of level L holds 100 L + 10 y + x. The gather returns the
+    // texels (i, j+1), (i+1, j+1), (i+1, j) and (i, j) of the level the instruction names, addressed by the sampler.
+    [Theory]
+    [InlineData(0.5f, 0.5f, 0f, SamplerAddressMode.ClampToEdge, 43f, 44f, 34f, 33f)]
+    [InlineData(0.5f, 0.5f, 1f, SamplerAddressMode.ClampToEdge, 121f, 122f, 112f, 111f)]
+    [InlineData(0.3f, 0.7f, 1f, SamplerAddressMode.ClampToEdge, 130f, 131f, 121f, 120f)]
+    [InlineData(0.5f, 0.5f, 2f, SamplerAddressMode.ClampToEdge, 210f, 211f, 201f, 200f)]
+    [InlineData(0.5f, 0.5f, 3f, SamplerAddressMode.ClampToEdge, 300f, 300f, 300f, 300f)]
+    [InlineData(0.5f, 0.5f, 1.4f, SamplerAddressMode.ClampToEdge, 121f, 122f, 112f, 111f)]
+    [InlineData(0.5f, 0.5f, 1.6f, SamplerAddressMode.ClampToEdge, 210f, 211f, 201f, 200f)]
+    [InlineData(0.5f, 0.5f, 9f, SamplerAddressMode.ClampToEdge, 300f, 300f, 300f, 300f)]
+    [InlineData(0.5f, 0.5f, -2f, SamplerAddressMode.ClampToEdge, 43f, 44f, 34f, 33f)]
+    [InlineData(0.99f, 0.99f, 1f, SamplerAddressMode.ClampToEdge, 133f, 133f, 133f, 133f)]
+    [InlineData(0.99f, 0.99f, 1f, SamplerAddressMode.Repeat, 103f, 100f, 130f, 133f)]
+    public void GatherWithALevelOfDetail_ReadsTheTexelsOfThatLevel(float u, float v, float lod, SamplerAddressMode addressMode,
+        float lowerLeft, float lowerRight, float upperRight, float upperLeft)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan))
+        {
+            return;
+        }
+
+        using var run = new Run(vulkan, GatherAtLevelProgram(u, v, lod), UserData(), 1);
+        var description = Describe(0, Format.R32Sfloat, GuestPixelFormat.Bits32Float, 8, 8, 4);
+        var image = run.Harness.CreateImage(description);
+        var texels = new List<float>();
+        for (var level = 0; level < 4; level++)
+        {
+            var size = 8 >> level;
+            for (var y = 0; y < size; y++)
+            {
+                for (var x = 0; x < size; x++)
+                {
+                    texels.Add(100 * level + 10 * y + x);
+                }
+            }
+        }
+
+        run.Harness.UploadImage(image, MemoryMarshal.AsBytes<float>(texels.ToArray()), ImageTestHarness.WholeImageCopies(description, 0));
+        var sampler = run.Runner.CreateSampler(Filter.Nearest, addressMode, maxLod: 16);
+        var views = new Dictionary<int, DescriptorImageInfo[]> { [run.ResourceAt(FirstImageAddress)] = [SampledView(image, levelCount: 4)] };
+        run.Dispatch(run.BindImages(views, [sampler]), command =>
+            image.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command));
+
+        float[] gathered = [.. Enumerable.Range(0, 4).Select(index => BitConverter.UInt32BitsToSingle(run.ResultWord(index)))];
+        Assert.Equal([lowerLeft, lowerRight, upperRight, upperLeft], gathered);
+        run.Harness.AssertNoValidationMessages();
+        output.WriteLine($"Verified a gather at level {lod} on {vulkan.DeviceName}; validation={vulkan.ValidationEnabled}.");
     }
 
     [Fact]

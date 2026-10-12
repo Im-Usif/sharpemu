@@ -5760,6 +5760,23 @@ public static partial class Gen5SpirvTranslator
                     goto GatherComplete;
                 }
 
+                if (instruction.Opcode == "ImageGather4L" &&
+                    resource.Dimension == SpirvImageDim.Dim2D)
+                {
+                    // OpImageGather has no level operand and reads the base level.
+                    sampled = EmitGatherAtLevel(
+                        image,
+                        resource,
+                        imageObject,
+                        coordinates,
+                        LoadImageFloatAddress(
+                            image,
+                            addressCursor + (int)coordinateComponentCount));
+                    sampled = UnpackImageGather(resource, image.Dmask, sampled);
+                    writeAllComponents = true;
+                    goto GatherComplete;
+                }
+
                 var operands = new List<uint>
                 {
                     imageObject,
@@ -5982,6 +5999,113 @@ public static partial class Gen5SpirvTranslator
                 values[1],
                 values[1],
                 values[0]);
+        }
+
+        // The four texels a gather reads, (i, j+1), (i+1, j+1), (i+1, j) and (i, j), taken from one level of
+        // detail. Each is sampled at its centre, so the sampler still applies its addressing and its level clamp.
+        private uint EmitGatherAtLevel(
+            Gen5ImageControl image,
+            SpirvImageResource resource,
+            uint sampledImage,
+            uint coordinates,
+            uint lod)
+        {
+            var imageValue = _module.AddInstruction(
+                SpirvOp.Image,
+                resource.ImageType,
+                sampledImage);
+            var lastLevel = _module.AddInstruction(
+                SpirvOp.ISub,
+                _intType,
+                _module.AddInstruction(SpirvOp.ImageQueryLevels, _intType, imageValue),
+                _module.Constant(_intType, 1));
+            var nearestLevel = _module.AddInstruction(
+                SpirvOp.ConvertFToS,
+                _intType,
+                Ext(8, _floatType, _module.AddInstruction(SpirvOp.FAdd, _floatType, lod, Float(0.5f))));
+            var level = Ext(45, _intType, nearestLevel, _module.Constant(_intType, 0), lastLevel);
+            var levelFloat = _module.AddInstruction(SpirvOp.ConvertSToF, _floatType, level);
+
+            var vec2Int = _module.TypeVector(_intType, 2);
+            var size = _module.AddInstruction(
+                SpirvOp.ImageQuerySizeLod,
+                resource.Arrayed ? _module.TypeVector(_intType, 3) : vec2Int,
+                imageValue,
+                level);
+            var texelPosition = coordinates;
+            var layer = 0u;
+            if (resource.Arrayed)
+            {
+                size = _module.AddInstruction(SpirvOp.VectorShuffle, vec2Int, size, size, 0u, 1u);
+                texelPosition = _module.AddInstruction(SpirvOp.VectorShuffle, _vec2Type, coordinates, coordinates, 0u, 1u);
+                layer = _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, coordinates, 2u);
+            }
+
+            var sizeFloat = _module.AddInstruction(SpirvOp.ConvertSToF, _vec2Type, size);
+            var half = _module.AddInstruction(SpirvOp.CompositeConstruct, _vec2Type, Float(0.5f), Float(0.5f));
+            var corner = Ext(
+                8,
+                _vec2Type,
+                _module.AddInstruction(
+                    SpirvOp.FSub,
+                    _vec2Type,
+                    _module.AddInstruction(SpirvOp.FMul, _vec2Type, texelPosition, sizeFloat),
+                    half));
+
+            uint component = 0;
+            if (resource.ConversionFormat == GuestImageFormat.Invalid)
+            {
+                while (component < 3 &&
+                       (image.Dmask & (1u << (int)component)) == 0)
+                {
+                    component++;
+                }
+            }
+
+            ReadOnlySpan<(float X, float Y)> centres = [(0.5f, 1.5f), (1.5f, 1.5f), (1.5f, 0.5f), (0.5f, 0.5f)];
+            var values = new uint[4];
+            for (var index = 0; index < values.Length; index++)
+            {
+                var centre = _module.AddInstruction(
+                    SpirvOp.FDiv,
+                    _vec2Type,
+                    _module.AddInstruction(
+                        SpirvOp.FAdd,
+                        _vec2Type,
+                        corner,
+                        _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec2Type,
+                            Float(centres[index].X),
+                            Float(centres[index].Y))),
+                    sizeFloat);
+                if (resource.Arrayed)
+                {
+                    centre = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _module.TypeVector(_floatType, 3),
+                        centre,
+                        layer);
+                }
+
+                var texel = _module.AddInstruction(
+                    SpirvOp.ImageSampleExplicitLod,
+                    resource.VectorType,
+                    sampledImage,
+                    centre,
+                    2u,
+                    levelFloat);
+                values[index] = _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    resource.ComponentType,
+                    texel,
+                    component);
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                resource.VectorType,
+                values);
         }
 
         private static bool TryGetPackedImageConversion(
