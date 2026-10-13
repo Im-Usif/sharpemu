@@ -2990,7 +2990,7 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode is "DsMinF32" or "DsMaxF32")
             {
-                if (instruction.Sources.Count < 3)
+                if (instruction.Sources.Count < 2)
                 {
                     error = $"missing LDS operands for {instruction.Opcode}";
                     return false;
@@ -3002,7 +3002,6 @@ public static partial class Gen5SpirvTranslator
                     EmitDataShareFloatAtomic(
                         floatPointer,
                         GetRawSource(instruction, 1),
-                        GetRawSource(instruction, 2),
                         instruction.Opcode == "DsMaxF32",
                         scope: 2,
                         semantics: 0x108));
@@ -3053,21 +3052,19 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        private uint DataShareFloatReplaces(uint observed, uint compare, bool maxValue)
-        {
-            var observedFloat = Bitcast(_floatType, observed);
-            var compareFloat = Bitcast(_floatType, compare);
-            return _module.AddInstruction(
+        // ds_min_f32 and ds_max_f32 have one data register, as LLVM's ds_min_f32 (atomic fmin)
+        // has: the stored value becomes the smaller or the larger of itself and DATA0. The DATA1
+        // field is 0 in compiled code, so reading it compares against whatever v0 holds.
+        private uint DataShareFloatReplaces(uint observed, uint data, bool maxValue) =>
+            _module.AddInstruction(
                 maxValue ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdLessThan,
                 _boolType,
-                maxValue ? observedFloat : compareFloat,
-                maxValue ? compareFloat : observedFloat);
-        }
+                Bitcast(_floatType, data),
+                Bitcast(_floatType, observed));
 
         private void EmitDataShareFloatAtomic(
             uint pointer,
             uint data,
-            uint compare,
             bool maxValue,
             uint scope,
             uint semantics)
@@ -3080,7 +3077,7 @@ public static partial class Gen5SpirvTranslator
                     _module.AddInstruction(
                         SpirvOp.Select,
                         _uintType,
-                        DataShareFloatReplaces(current, compare, maxValue),
+                        DataShareFloatReplaces(current, data, maxValue),
                         data,
                         current));
                 return;
@@ -3110,7 +3107,7 @@ public static partial class Gen5SpirvTranslator
                 preheader,
                 exchanged,
                 continueLabel);
-            var replace = DataShareFloatReplaces(observed, compare, maxValue);
+            var replace = DataShareFloatReplaces(observed, data, maxValue);
             var next = _module.AddInstruction(SpirvOp.Select, _uintType, replace, data, observed);
 
             _module.AddStatement(

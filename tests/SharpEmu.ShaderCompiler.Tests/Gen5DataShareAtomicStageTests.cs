@@ -30,8 +30,8 @@ public sealed class Gen5DataShareAtomicStageTests
         { "DsCmpstB32", 3, false },
         { "DsCmpstRtnB32", 3, true },
         { "DsMskorB32", 3, false },
-        { "DsMinF32", 3, false },
-        { "DsMaxF32", 3, false },
+        { "DsMinF32", 2, false },
+        { "DsMaxF32", 2, false },
         { "DsAddU64", 3, false },
         { "DsOrB64", 3, false },
     };
