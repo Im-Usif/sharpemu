@@ -267,9 +267,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
                 viewMip = -1;
                 viewLayer = -1;
             }
-            else if (request.Role == ImageRole.StorageImage && viewMip < 0 && viewLayer < 0 &&
-                     resolved.Description.IsBlock && !request.Description.IsBlock &&
-                     (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0)
+            else if (viewMip < 0 && viewLayer < 0 && resolved.Description.IsBlock && !request.Description.IsBlock &&
+                     ((request.Role == ImageRole.StorageImage && (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0) ||
+                      request.View.LevelCount > 1 || request.View.LayerCount > 1))
             {
                 result = ReplaceCompressedForStorage(request.Description, result);
             }

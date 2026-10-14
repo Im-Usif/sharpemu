@@ -613,10 +613,11 @@ public sealed partial class GuestImageCache
         source.Pitch == destination.Pitch && SameExtent(source.Extent, destination.Extent) &&
         source.FindMatchingArraySlice(destination, 0) == 0;
 
-    // A compute shader writes the blocks of a compressed image through an
-    // uncompressed view, but the driver could not give that image storage usage.
-    // The blocks move to an uncompressed image of the same memory; the next
-    // compressed request copies them back (the IsBlock branch of ResolveOverlap).
+    // A shader reaches the blocks of a compressed image through an uncompressed view the image
+    // cannot give: storage usage the driver refused, or more than one level or layer (Vulkan views
+    // blocks in an uncompressed format one level and one layer at a time). The blocks move to an
+    // uncompressed image of the same memory; the next compressed request copies them back (the
+    // IsBlock branch of ResolveOverlap).
     private ResourceSlotIdentifier ReplaceCompressedForStorage(in ImageDescription requested, ResourceSlotIdentifier cachedImageIdentifier)
     {
         var replacementImageIdentifier = InsertImage(requested);

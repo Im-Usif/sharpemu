@@ -21,6 +21,21 @@ public sealed partial class GuestImageCacheTests
     private static ImageRequest BlockAliasStorage(ulong address) =>
         AsStorage(LinearRequest(address, BlockImageBytes, Format.R16G16B16A16Uint, GuestPixelFormat.Bits16_16_16_16UInt, GuestImageType.Color2D, new Extent3D(16, 16, 1), 1, 8, 1));
 
+    private const uint BlockArrayLayers = 4;
+
+    private static ImageRequest CompressedArray(ulong address) =>
+        LinearRequest(address, BlockImageBytes * BlockArrayLayers, Format.BC1RgbaSrgbBlock, GuestPixelFormat.Bc1Srgb, GuestImageType.Color2D,
+            new Extent3D(64, 64, 1), BlockArrayLayers, 8, 1);
+
+    // A shader reads the blocks of the array through an uncompressed view of the given layers (a copy of streamed mips).
+    private static ImageRequest BlockAliasArray(ulong address, uint viewLayers)
+    {
+        var request = LinearRequest(address, BlockImageBytes * BlockArrayLayers, Format.R16G16B16A16Uint, GuestPixelFormat.Bits16_16_16_16UInt,
+            GuestImageType.Color2D, new Extent3D(16, 16, 1), BlockArrayLayers, 8, 1);
+        request.View = request.View with { LayerCount = viewLayers, Type = viewLayers > 1 ? ImageViewType.Type2DArray : ImageViewType.Type2D };
+        return request;
+    }
+
     // An image the guest has not touched for more than the removal window may be deleted by an overlapping request.
     private static void AgeBeyondTheRemovalWindow(CacheHarness harness, ResourceSlotIdentifier imageIdentifier)
     {
@@ -56,6 +71,43 @@ public sealed partial class GuestImageCacheTests
         Assert.Equal(new[] { aliasId }, harness.Images.FindImagesInRangeForTest(address, BlockImageBytes, pageOverlap: false));
         Assert.True(harness.Image(aliasId).IsGpuModified);
         Assert.False(harness.Image(aliasId).IsCpuDirty);
+    }
+
+    // Vulkan views the blocks of a compressed image in an uncompressed format one level and one layer at a time
+    // (VK_KHR_maintenance2). A view of several layers is undefined: the driver lays its layers out as a one-level
+    // image and the shader reads blocks of other layers. The blocks move to an uncompressed image instead.
+    [Fact]
+    public void FindImage_AnUncompressedViewOfSeveralLayersOfACompressedArrayIsNotAViewOfIt()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var compressed = CompressedArray(address);
+        var compressedId = harness.Acquire(ref compressed);
+        harness.MarkGpuWritten(compressedId);
+
+        var alias = BlockAliasArray(address, BlockArrayLayers);
+        var aliasId = harness.Find(ref alias);
+
+        Assert.False(harness.Image(aliasId).Description.IsBlock);
+        Assert.Equal(new[] { aliasId }, harness.Images.FindImagesInRangeForTest(address, BlockImageBytes * BlockArrayLayers, pageOverlap: false));
+        Assert.True(harness.Image(aliasId).IsGpuModified);
+    }
+
+    [Fact]
+    public void FindImage_AnUncompressedViewOfOneLayerOfACompressedImageViewsIt()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var compressed = CompressedArray(address);
+        var compressedId = harness.Acquire(ref compressed);
+
+        var alias = BlockAliasArray(address, 1);
+        var aliasId = harness.Find(ref alias);
+
+        Assert.Equal(compressedId, aliasId);
+        Assert.True(harness.Image(aliasId).Description.IsBlock);
     }
 
     [Fact]
