@@ -122,15 +122,7 @@ public sealed partial class GuestImageCache
                             $"Could not read DCC metadata backing: address=0x{address + position:X16} size=0x{length:X}.");
                     }
 
-                    for (var index = 0; index < chunk.Length; index++)
-                    {
-                        if (chunk[index] != code)
-                        {
-                            uniform = false;
-                            break;
-                        }
-                    }
-
+                    uniform = chunk.IndexOfAnyExcept(code) < 0;
                     position += (ulong)length;
                 }
 
