@@ -66,7 +66,11 @@ public sealed class GuestGpuMemory : IDisposable
     public bool TryResolveFault(FaultKind kind, ulong address)
     {
         using var profile = GpuMemoryAccessProfile.MeasureFault(kind);
-        const ulong faultSize = 8;
+        // The fault names a byte in the page whose protection stopped the access, so the range ends
+        // with that page: a store to the last bytes of a span is still the span's, and an access
+        // that reaches into the next page faults again there.
+        const ulong accessBytes = 8;
+        var faultSize = Math.Min(accessBytes, TrackerLayout.PageBytes - (address & (TrackerLayout.PageBytes - 1)));
         if (!Covers(address, faultSize))
         {
             TraceFault("unregistered");
