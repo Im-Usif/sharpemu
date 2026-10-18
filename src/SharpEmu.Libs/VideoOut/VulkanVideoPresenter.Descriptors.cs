@@ -818,6 +818,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
+                    // A held command write or a pending dump lands before the shader reads the range.
+                    CompleteOverlappingPublications(range.Base, size, includeLabels: false);
                     // Stream buffers do not populate the device-address page table.
                     _ = _bufferCache.FindBuffer(range.Base, size);
                     _bufferCache.SynchronizeBuffersInRange(range.Base, size);

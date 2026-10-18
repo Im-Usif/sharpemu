@@ -140,6 +140,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint)))
             {
@@ -198,11 +199,22 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // A held-back command write or label lands in guest memory only when its publication runs; a resource
+        // read behind it in the command stream must see it, as the command processor's own reads do.
+        private void CompletePendingPublicationsForResourceRead(ulong address, ulong size)
+        {
+            if (!HasPendingMemoryPublication(address, size)) return;
+            if (_concurrentAssumptions is not null)
+                throw new SubmissionScheduler.AbandonedWorkException($"The resolution reads memory a pending publication writes: address=0x{address:X16}.");
+            CompleteOverlappingPublications(address, size);
+        }
+
         // Refused while a GPU buffer or image write may still own the range.
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
+            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
@@ -234,6 +246,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var size = (ulong)destination.Length;
+            CompletePendingPublicationsForResourceRead(address, size);
             if (clean || !IsCleanReadPage(address, size))
             {
                 if (!_guestMemory.CanRead(address, size) ||
