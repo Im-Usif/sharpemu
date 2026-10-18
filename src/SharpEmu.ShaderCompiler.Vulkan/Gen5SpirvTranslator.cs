@@ -8091,7 +8091,7 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        private uint LaneSelectMask => _stage == Gen5SpirvStage.Compute ? _waveLaneCount - 1 : 63u;
+        private uint LaneSelectMask => _stage is Gen5SpirvStage.Compute or Gen5SpirvStage.Mesh ? _waveLaneCount - 1 : 63u;
 
         private uint ReadLaneSpillSlot(Gen5ShaderInstruction instruction, uint selectedLane, uint value)
         {

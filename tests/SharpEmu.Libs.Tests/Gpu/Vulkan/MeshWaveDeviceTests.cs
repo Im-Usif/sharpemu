@@ -14,6 +14,54 @@ namespace SharpEmu.Libs.Tests.Gpu.Vulkan;
 
 public sealed class MeshWaveDeviceTests(HeadlessVulkanFixture fixture) : IClassFixture<HeadlessVulkanFixture>
 {
+    // V_READLANE_B32 and V_WRITELANE_B32 select lane S1 % 32 in a wave32 wave, so lane 33 is lane 1.
+    [Fact]
+    public void Wave32MeshLaneSelectWrapsAtTheWaveSize()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        if (!vulkan.SupportsMeshShaders || vulkan.SubgroupSize != 32)
+        {
+            Assert.False(GatePrerequisites.DeviceRequired, "This test requires mesh shaders with 32-lane subgroups.");
+            return;
+        }
+        var instructions = new List<Gen5ShaderInstruction>();
+        void Add(Gen5ShaderInstruction instruction) => instructions.Add(instruction with { Pc = (uint)instructions.Count * 8 });
+        Add(MoveScalar(0, 126, uint.MaxValue));
+        Add(Vop3(0, "VMbcntLoU32B32", 2, Operand(uint.MaxValue), Operand(0)));
+        Add(MoveVector(0, 9, 0));
+        Add(MoveScalar(0, 20, 0xABC));
+        Add(WriteLane(0, 9, 20, 33));
+        Add(ReadLane(0, 21, 2, 33));
+        Add(MoveVectorFromScalar(0, 10, 21));
+        Add(Vop2(0, "VLshlrevB32", 7, Operand(2), Gen5Operand.Vector(2)));
+        Add(BufferAccess(0, "BufferStoreDword", 8, vectorData: 9, offsetEnabled: true, vectorAddress: 7));
+        Add(BufferAccess(0, "BufferStoreDword", 8, offset: 128, vectorData: 10, offsetEnabled: true, vectorAddress: 7));
+        Add(EndProgram(0));
+        var (plan, resources, layout) = Prepare(Program([.. instructions]), ShaderStage.Mesh);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 32, LocalSizeX = 32,
+            Mesh = new MeshShaderConfiguration(32, 10, 0, 10, 30, 0, false, 32),
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        using var harness = new ImageTestHarness(vulkan);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv);
+        var output = runner.CreateBuffer(new byte[256]);
+        var registers = new uint[256];
+        registers[10] = 256;
+        harness.Run(() => runner.Dispatch(registers,
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [output] },
+            1, meshDrawParameters: [3, 0, 0, 0, 0, 0]));
+        var bytes = runner.ReadBack(output, 0, 256);
+        for (var lane = 0; lane < 32; lane++)
+        {
+            Assert.Equal(lane == 1 ? 0xABCu : 0u, BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(lane * 4)));
+            Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(128 + lane * 4)));
+        }
+        harness.AssertNoValidationMessages();
+    }
+
     [Theory]
     [InlineData(77u, 0xFACu)]
     [InlineData(13u, 0xFACu)]

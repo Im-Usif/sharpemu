@@ -5613,8 +5613,9 @@ public static partial class Gen5SpirvTranslator
                     ? broadcast
                     : _module.AddInstruction(SpirvOp.Select, _uintType, emulated.LaneRuns(selectedLane), broadcast, spilled));
             }
-            else if (_subgroupInvocationIdInput != 0 && _stage == Gen5SpirvStage.Compute)
+            else if (_subgroupInvocationIdInput != 0 && _stage is Gen5SpirvStage.Compute or Gen5SpirvStage.Mesh)
             {
+                // A mesh wave is a host subgroup too, so the selected lane is readable.
                 var broadcast = BroadcastWaveLane(sourceValue, selectedLane);
                 StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, broadcast));
             }
