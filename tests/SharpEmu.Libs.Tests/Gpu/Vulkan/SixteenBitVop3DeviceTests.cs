@@ -27,6 +27,13 @@ public sealed class SixteenBitVop3DeviceTests(HeadlessVulkanFixture fixture) : I
             new Case("abs src1", "VPackB32F16", new Gen5Vop3Control(0b10, 0, 0, false, 0, null), 0x3C00u, 0xC000u, 0u, 0x4000_3C00u),
             new Case("no modifiers", "VPackB32F16", new Gen5Vop3Control(0, 0, 0, false, 0, null), 0xBC00u, 0xC000u, 0u, 0xC000_BC00u));
 
+    // V_MAD_U32_U16 is in the op_sel table: (lo 5, hi 3) and (lo 2, hi 7) with op_sel on both sources give 3 * 7 + 100.
+    [Fact]
+    public void MadU32U16ReadsTheHalvesOpSelPicks() =>
+        Check(
+            new Case("high halves", "VMadU32U16", new Gen5Vop3Control(0, 0, 0, false, 0b011, null), 0x0003_0005u, 0x0007_0002u, 100u, 121u),
+            new Case("low halves", "VMadU32U16", new Gen5Vop3Control(0, 0, 0, false, 0, null), 0x0003_0005u, 0x0007_0002u, 100u, 110u));
+
     private void Check(params Case[] cases)
     {
         var vulkan = fixture.Vulkan;

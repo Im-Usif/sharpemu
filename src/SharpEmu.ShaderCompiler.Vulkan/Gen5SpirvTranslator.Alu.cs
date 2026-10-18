@@ -1259,12 +1259,9 @@ public static partial class Gen5SpirvTranslator
                 }
                 case "VMadU32U16":
                 {
-                    var left = BitwiseAnd(
-                        GetRawSource(instruction, 0),
-                        UInt(0xFFFF));
-                    var right = BitwiseAnd(
-                        GetRawSource(instruction, 1),
-                        UInt(0xFFFF));
+                    // op_sel picks the half of each 16-bit source.
+                    var left = GetInt16Source(instruction, 0, signed: false);
+                    var right = GetInt16Source(instruction, 1, signed: false);
                     result = IAdd(
                         _module.AddInstruction(
                             SpirvOp.IMul,
