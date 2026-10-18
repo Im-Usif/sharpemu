@@ -1302,6 +1302,10 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 Store(_programActive, invocationInBounds);
+                if (_stage == Gen5SpirvStage.Compute && _waveLowering is EmulatedWave64Lowering emulated)
+                {
+                    emulated.StartWithRunningLanes(invocationInBounds);
+                }
 
                 if (_request.ComputeSystemRegisters is { } registers)
                 {

@@ -49,7 +49,10 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
         Add(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vop3, opcode, [0u, 0u], [left, right], [Gen5Operand.Scalar(destination)],
             new Gen5Vop3Control(0, 0, 0, false, 0, destination)));
 
-    protected uint[] Run(uint localDataShareDwords = 0, uint sizeX = 8, uint sizeY = 8, bool? laneLocal = null)
+    // fixedThreadsX and fixedThreadsY put a thread count that can end inside the group in the module. With
+    // dispatchLimits the thread count comes with each dispatch instead, and the pipeline runs once per entry.
+    protected uint[] Run(uint localDataShareDwords = 0, uint sizeX = 8, uint sizeY = 8, bool? laneLocal = null,
+        uint? fixedThreadsX = null, uint? fixedThreadsY = null, (uint X, uint Y)[]? dispatchLimits = null)
     {
         var threads = sizeX * sizeY;
         Add(Vop2(0, "VLshlrevB32", 5, Operand(2), Gen5Operand.Vector(2)));
@@ -62,11 +65,11 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
             Assert.True(expected || reason.Length != 0);
         }
 
-        var (plan, resources, layout) = Prepare(program);
+        var (plan, resources, layout) = Prepare(program, usesDispatchThreadLimits: dispatchLimits is not null);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
-            LocalSizeX = sizeX, LocalSizeY = sizeY, ThreadCountX = sizeX, ThreadCountY = sizeY, WaveSize = 64,
-            LocalDataShareDwords = localDataShareDwords, HostComputeSubgroup32 = HostSubgroup32,
+            LocalSizeX = sizeX, LocalSizeY = sizeY, ThreadCountX = fixedThreadsX ?? sizeX, ThreadCountY = fixedThreadsY ?? sizeY,
+            WaveSize = 64, LocalDataShareDwords = localDataShareDwords, HostComputeSubgroup32 = HostSubgroup32,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         if (HostSubgroup32 && laneLocal is { } oneLanePerInvocation)
@@ -81,8 +84,19 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
         var output = runner.CreateBuffer(threads * 4);
         var registers = new uint[256];
         registers[6] = threads * 4;
-        harness.Run(() => runner.Dispatch(registers,
-            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [output] }, 1));
+        var buffers = new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [output] };
+        if (dispatchLimits is null)
+        {
+            harness.Run(() => runner.Dispatch(registers, buffers, 1));
+        }
+        else
+        {
+            foreach (var (x, y) in dispatchLimits)
+            {
+                harness.Run(() => runner.Dispatch(registers, buffers, 1, dispatchThreadLimits: [x, y, 1]));
+            }
+        }
+
         var bytes = runner.ReadBack(output, 0, threads * 4);
         harness.AssertNoValidationMessages();
         var lanes = new uint[threads];
@@ -181,16 +195,141 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
     public void AnExecBranch_IsDecidedForTheWholeWave(uint firstActiveLane, uint expected)
     {
         if (!Ready()) return;
+        ExecBranch(firstActiveLane);
+
+        Assert.All(Run(), value => Assert.Equal(expected, value));
+    }
+
+    // The join sets EXEC to every lane, or restores the EXEC saved before the compare, as compiled code does.
+    protected void ExecBranch(uint firstActiveLane, bool restoreSavedExec = false)
+    {
         Lane();
         Add(MoveScalar(0, 20, 5));
+        if (restoreSavedExec) Add(Sop1(0, "SMovB64", 30, Gen5Operand.Scalar(Exec)));
         Add(Vopc(0, "VCmpxLeU32", Operand(firstActiveLane), 2));
         var skip = Add(Branch(0, "SCbranchExecz", 0));
         Add(MoveScalar(0, 20, 77));
-        var join = Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        var join = Add(Sop1(0, "SMovB64", Exec, restoreSavedExec ? Gen5Operand.Scalar(30) : AllLanes));
         Point(skip, join);
         Add(MoveVectorFromScalar(0, 4, 20));
+    }
 
-        Assert.All(Run(), value => Assert.Equal(expected, value));
+    // A wave64 program can declare a group of fewer than 64 threads (48 x 1 x 1): one wave whose top lanes never run.
+    // EXEC starts as every thread of the group, in both halves of the wave.
+    [Theory]
+    [InlineData(48u)]
+    [InlineData(33u)]
+    [InlineData(63u)]
+    public void AGroupSmallerThanTheWave_StartsWithEveryThreadInExec(uint threads)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(Exec)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        Assert.All(Run(sizeX: threads, sizeY: 1), value => Assert.Equal(threads, value));
+    }
+
+    // The lanes of EXEC below each lane, counted in both of its words: every lane's own index.
+    [Fact]
+    public void AGroupSmallerThanTheWave_CountsTheLanesBelowEachLaneAcrossTheHalves()
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop3(0, "VMbcntLoU32B32", 4, Gen5Operand.Scalar(Exec), Operand(0)));
+        Add(Vop3(0, "VMbcntHiU32B32", 4, Gen5Operand.Scalar(Exec + 1), Gen5Operand.Vector(4)));
+
+        var lanes = Run(sizeX: 48, sizeY: 1);
+        for (uint lane = 0; lane < 48; lane++)
+        {
+            Assert.Equal(lane, lanes[lane]);
+        }
+    }
+
+    [Fact]
+    public void AGroupSmallerThanTheWave_CollectsACompareAcrossTheHalves()
+    {
+        if (!Ready()) return;
+        Lane();
+        CompareTo("VCmpLtU32", 10, Gen5Operand.Vector(2), Operand(40));
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(10)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        Assert.All(Run(sizeX: 48, sizeY: 1), value => Assert.Equal(40u, value));
+    }
+
+    [Theory]
+    [InlineData(40u, 77u)]
+    [InlineData(8u, 77u)]
+    [InlineData(48u, 5u)]
+    public void AnExecBranchInAGroupSmallerThanTheWave_IsDecidedForTheWholeWave(uint firstActiveLane, uint expected)
+    {
+        if (!Ready()) return;
+        ExecBranch(firstActiveLane);
+
+        Assert.All(Run(sizeX: 48, sizeY: 1), value => Assert.Equal(expected, value));
+    }
+
+    // A group that is not full runs only the lanes below the thread count, and EXEC starts as those lanes.
+    [Theory]
+    [InlineData(3u)]
+    [InlineData(5u)]
+    public void APartialWave_StartsWithTheLanesThatRun(uint rows)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(Exec)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        var lanes = Run(dispatchLimits: [(8, rows)]);
+        for (uint lane = 0; lane < 64; lane++)
+        {
+            Assert.Equal(lane < rows * 8 ? rows * 8 : 0u, lanes[lane]);
+        }
+    }
+
+    // 492 items leave 44 threads to the last wave, in groups of 64 threads or of 256, whether the program fixes the count or
+    // the dispatch supplies it. That wave starts with those 44 lanes in EXEC, and each lane counts the running lanes below it.
+    [Theory]
+    [InlineData(64u, false)]
+    [InlineData(64u, true)]
+    [InlineData(256u, false)]
+    [InlineData(256u, true)]
+    public void AWaveOf44RunningLanes_StartsWithTheLanesThatRun(uint groupThreads, bool countFromTheDispatch)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(Exec)));
+        Add(Vop3(0, "VMbcntLoU32B32", 3, Gen5Operand.Scalar(Exec), Operand(0)));
+        Add(Vop3(0, "VMbcntHiU32B32", 3, Gen5Operand.Scalar(Exec + 1), Gen5Operand.Vector(3)));
+        Add(Vop2(0, "VLshlrevB32", 3, Operand(8), Gen5Operand.Vector(3)));
+        Add(Vop2(0, "VOrB32", 4, Gen5Operand.Scalar(14), Gen5Operand.Vector(3)));
+
+        var running = groupThreads - 20;
+        var lanes = countFromTheDispatch
+            ? Run(sizeX: groupThreads, sizeY: 1, dispatchLimits: [(running, 1)])
+            : Run(sizeX: groupThreads, sizeY: 1, fixedThreadsX: running);
+        for (uint thread = 0; thread < groupThreads; thread++)
+        {
+            var waveLanes = Math.Min(running - (thread & ~63u), 64u);
+            Assert.Equal(thread < running ? waveLanes | ((thread & 63) << 8) : 0u, lanes[thread]);
+        }
+    }
+
+    // The second dispatch runs three rows: none of the upper half of the wave runs, and none of the lanes that run passes
+    // the compare. The first dispatch ran the whole wave; what it left where the halves exchange their masks must not
+    // count as lanes of the second, or EXEC names lanes that can never clear their bit.
+    [Fact]
+    public void AnExecBranchInAPartialWave_SeesOnlyTheLanesThatRun()
+    {
+        if (!Ready()) return;
+        ExecBranch(firstActiveLane: 32, restoreSavedExec: true);
+
+        var lanes = Run(dispatchLimits: [(8, 8), (8, 3)]);
+        for (var lane = 0; lane < 64; lane++)
+        {
+            Assert.Equal(lane < 24 ? 5u : 77u, lanes[lane]);
+        }
     }
 
     [Theory]
@@ -650,5 +789,120 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
         Add(Vop2(0, "VAddU32", 4, Gen5Operand.Vector(14), Gen5Operand.Vector(4)));
 
         Assert.All(RunGroupOfFourWaves(64), value => Assert.Equal(4 * passing, value));
+    }
+
+    // Two rows of 32 threads make a wave. With 20 threads of every row to run, each wave starts with 20 lanes of each half.
+    [Fact]
+    public void AGroupOfFourWavesWithShortRows_StartsEachWaveWithTheLanesThatRun()
+    {
+        if (!Ready()) return;
+        Lane(rowShift: 5);
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(Exec)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        var lanes = Run(sizeX: 32, sizeY: 8, dispatchLimits: [(20, 8)]);
+        for (uint thread = 0; thread < 256; thread++)
+        {
+            Assert.Equal((thread & 31) < 20 ? 40u : 0u, lanes[thread]);
+        }
+    }
+
+    // Two rows of 32 threads make a wave. With five rows to run, the third wave runs its lower half alone and the fourth
+    // does not run.
+    [Fact]
+    public void APartialWaveOfAGroupOfFourWaves_StartsWithTheLanesThatRun()
+    {
+        if (!Ready()) return;
+        Lane(rowShift: 5);
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(Exec)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        var lanes = Run(sizeX: 32, sizeY: 8, dispatchLimits: [(32, 5)]);
+        for (uint thread = 0; thread < 256; thread++)
+        {
+            Assert.Equal(thread < 128 ? 64u : thread < 160 ? 32u : 0u, lanes[thread]);
+        }
+    }
+
+    // The same five rows: each wave counts a compare over the lanes that run, and the third wave, with no upper half that
+    // runs, exchanges its masks without one.
+    [Fact]
+    public void APartialWaveOfAGroupOfFourWaves_CountsACompareOverTheLanesThatRun()
+    {
+        if (!Ready()) return;
+        Lane(rowShift: 5);
+        Add(Vop2(0, "VAndB32", 3, Operand(63), Gen5Operand.Vector(2)));
+        CompareTo("VCmpLtU32", 10, Gen5Operand.Vector(3), Operand(40));
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(10)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        var lanes = Run(sizeX: 32, sizeY: 8, dispatchLimits: [(32, 5)]);
+        for (uint thread = 0; thread < 256; thread++)
+        {
+            Assert.Equal(thread < 128 ? 40u : thread < 160 ? 32u : 0u, lanes[thread]);
+        }
+    }
+
+    // A loop that waits for EXEC to empty ends in a group that does not run whole: the lanes that do not run are not in
+    // EXEC. Sixteen threads of the second wave run, all in its lower half, and the other two waves do not run.
+    [Fact]
+    public void AWaterfallLoopInAPartialGroup_VisitsEveryValueOfTheLanesThatRun()
+    {
+        if (!Ready()) return;
+        Lane(rowShift: 4);
+        Add(Vop2(0, "VAndB32", 3, Operand(3), Gen5Operand.Vector(2)));
+        Add(Sop1(0, "SMovB64", 30, Gen5Operand.Scalar(Exec)));
+        var loop = Add(ReadFirstLane(0, 20, 3));
+        CompareTo("VCmpEqU32", 22, Gen5Operand.Vector(3), Gen5Operand.Scalar(20));
+        Add(Sop1(0, "SAndSaveexecB64", 24, Gen5Operand.Scalar(22)));
+        Add(MoveVectorFromScalar(0, 4, 20));
+        Add(Vop2(0, "VAddU32", 4, Operand(100), Gen5Operand.Vector(4)));
+        Add(Sop2(0, "SXorB64", Exec, Gen5Operand.Scalar(24), Gen5Operand.Scalar(Exec)));
+        var back = Add(Branch(0, "SCbranchExecnz", 0));
+        Point(back, loop);
+        Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(30)));
+
+        var lanes = Run(sizeX: 16, sizeY: 16, laneLocal: true, dispatchLimits: [(16, 5)]);
+        for (uint index = 0; index < 256; index++)
+        {
+            Assert.Equal(index < 80 ? (index & 3) + 100 : 0u, lanes[index]);
+        }
+    }
+
+    // A group of 96 threads is one whole wave and one that has no upper half.
+    [Fact]
+    public void AGroupWithAHalfLastWave_CountsEachWaveOverItsOwnLanes()
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAndB32", 3, Operand(63), Gen5Operand.Vector(2)));
+        CompareTo("VCmpLtU32", 10, Gen5Operand.Vector(3), Operand(40));
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(10)));
+        Add(Sop1(0, "SBcnt1I32B64", 15, Gen5Operand.Scalar(Exec)));
+        Add(Sop2(0, "SLshlB32", 15, Gen5Operand.Scalar(15), Operand(8)));
+        Add(Sop2(0, "SOrB32", 14, Gen5Operand.Scalar(14), Gen5Operand.Scalar(15)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        var lanes = Run(sizeX: 96, sizeY: 1);
+        for (uint thread = 0; thread < 96; thread++)
+        {
+            Assert.Equal(thread < 64 ? 40u | (64u << 8) : 32u | (32u << 8), lanes[thread]);
+        }
+    }
+
+    // A group of 16 threads fills a quarter of its wave, and no lane of the upper half exists.
+    [Fact]
+    public void AGroupOfSixteenThreads_CountsOnlyItsLanes()
+    {
+        if (!Ready()) return;
+        Lane();
+        CompareTo("VCmpLtU32", 10, Gen5Operand.Vector(2), Operand(10));
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(10)));
+        Add(Sop1(0, "SBcnt1I32B64", 15, Gen5Operand.Scalar(Exec)));
+        Add(Sop2(0, "SLshlB32", 15, Gen5Operand.Scalar(15), Operand(8)));
+        Add(Sop2(0, "SOrB32", 14, Gen5Operand.Scalar(14), Gen5Operand.Scalar(15)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        Assert.All(Run(sizeX: 16, sizeY: 1), value => Assert.Equal(10u | (16u << 8), value));
     }
 }
