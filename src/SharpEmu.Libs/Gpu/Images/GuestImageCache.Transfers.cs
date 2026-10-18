@@ -791,6 +791,7 @@ public sealed unsafe partial class GuestImageCache
     }
 
     // Publishes a GPU-owned image to guest memory after its tick completes; false when it cannot.
+    // A guest store into the range before then is newer than the readback and keeps its page.
     private bool TryDownloadToGuest(ResourceSlotIdentifier imageIdentifier)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
@@ -825,6 +826,7 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
+        var landing = _readbackLandings.Queue(range.Address, download.Mapped.Slice((int)offset, (int)range.Size));
         download.Flush(offset, range.Size);
         DownloadToBuffer(image, download, offset, range.Size, plan);
         var barrier = new BufferMemoryBarrier2
@@ -846,7 +848,9 @@ public sealed unsafe partial class GuestImageCache
             download.Invalidate(offset, range.Size);
             GpuWritebackEpoch.Advance();
             var published = download.Mapped.Slice((int)offset, (int)range.Size);
-            if (!backing.TryWriteBacking(range.Address, published) &&
+            // A range that lost resident pages since it was queued cannot be compared page by page; its resident pages
+            // take the readback whole, as before the landing.
+            if (!landing.TryLand(backing, published) &&
                 !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
             {
                 throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");

@@ -568,4 +568,77 @@ public sealed partial class GuestImageCacheTests
 
         harness.Shutdown();
     }
+
+    // A readback lands in guest memory when its tick completes. A guest store into those bytes after the
+    // readback was queued is newer than the image's contents and keeps its page; the other pages land. The
+    // store needs no notification: an evicted image no longer watches its pages.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CpuWriteDuringReadback_SurvivesTheLanding(bool evicted)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var request = Color32(address, 8192);
+        var imageIdentifier = harness.Acquire(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111u)));
+        if (evicted)
+        {
+            harness.Worker.Run(() =>
+            {
+                harness.Images.SetCollectionThresholds(0, 0, ulong.MaxValue, 81);
+                harness.Images.ResetRecency(new[] { imageIdentifier }, 81);
+                harness.Images.RunGarbageCollector();
+            });
+            Assert.False(harness.Images.Contains(imageIdentifier));
+        }
+        else
+        {
+            Assert.True(harness.Worker.Run(() => harness.Images.TryDownloadForTest(imageIdentifier)));
+        }
+
+        var store = address + 0x5000;
+        harness.Write(store, Bytes(0x44444444u, 0x45454545u));
+        harness.Finish();
+
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address));
+        Assert.Equal(0x44444444u, harness.ReadUInt32(store));
+        Assert.Equal(0x45454545u, harness.ReadUInt32(store + 4));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address + 0x7ffc));
+        harness.Shutdown();
+    }
+
+    // Readbacks over the same bytes land in the order they were queued: what one landing writes is no guest
+    // store to the other.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void OverlappingReadbacks_LandInQueueOrder(bool innerFirst)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var outer = Color32(address, 8192);
+        var inner = Color32(address + 0x2000, 2048);
+        var outerIdentifier = harness.Acquire(ref outer);
+        var innerIdentifier = harness.Acquire(ref inner);
+        Assert.NotEqual(outerIdentifier, innerIdentifier);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111u)));
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address + 0x2000, 0x2000, 0x22222222u)));
+
+        harness.Worker.Run(() =>
+        {
+            Assert.True(harness.Images.TryDownloadForTest(innerFirst ? innerIdentifier : outerIdentifier));
+            Assert.True(harness.Images.TryDownloadForTest(innerFirst ? outerIdentifier : innerIdentifier));
+        });
+        harness.Finish();
+
+        var expected = innerFirst ? 0x11111111u : 0x22222222u;
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address));
+        Assert.Equal(expected, harness.ReadUInt32(address + 0x2000));
+        Assert.Equal(expected, harness.ReadUInt32(address + 0x3ffc));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address + 0x4000));
+        harness.Shutdown();
+    }
 }
