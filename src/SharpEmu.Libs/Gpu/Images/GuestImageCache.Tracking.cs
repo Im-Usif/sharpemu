@@ -472,14 +472,24 @@ public sealed partial class GuestImageCache
         return covered;
     }
 
-    public void InvalidateMemoryFromGpu(ulong address, ulong size)
+    public void InvalidateMemoryFromGpu(ulong address, ulong size) => InvalidateMemoryFromGpu(address, size, publish: true);
+
+    // A formatted shader write whose partly written images were published when its stage was prepared: the
+    // images under it lose their ownership only after its buffer took the contents of an image it starts at.
+    public void InvalidateMemoryFromGpuAfterPublish(ulong address, ulong size) => InvalidateMemoryFromGpu(address, size, publish: false);
+
+    private void InvalidateMemoryFromGpu(ulong address, ulong size, bool publish)
     {
         if (!IsValidRange(address, size))
         {
             return;
         }
 
-        PublishPartlyWrittenImages(address, size);
+        if (publish)
+        {
+            PublishPartlyWrittenImages(address, size);
+        }
+
         using var held = _lock.Hold();
         if (ImageClearTrace.Enabled)
             _metadataHistory.RecordRange(CreateMetadataEvent("gpu-write-notification", address, size));
@@ -520,6 +530,10 @@ public sealed partial class GuestImageCache
                     (partlyWritten ??= []).Add(imageIdentifier);
                 }
             }
+
+            // Images over the same bytes publish in the order the GPU wrote them, so the buffer ends with
+            // the newest contents whichever image the owner table lists first.
+            partlyWritten?.Sort((left, right) => _slots[left].GpuWriteSequence.CompareTo(_slots[right].GpuWriteSequence));
         }
 
         foreach (var imageIdentifier in partlyWritten ?? [])
@@ -547,6 +561,18 @@ public sealed partial class GuestImageCache
                     image.ClearGpuModified();
                 }
             }
+        }
+    }
+
+    // A raw binding that covers only part of a GPU-modified image names memory the guest gave to a buffer.
+    // Before the shader writes it, the image's contents move into the buffer, so no later publish of the
+    // image can put them over the shader's bytes. A binding that covers an image whole may be a window
+    // that never writes there; the image keeps its bytes.
+    public void PublishImagesUnderRawWrite(ulong address, ulong size)
+    {
+        if (IsValidRange(address, size))
+        {
+            PublishPartlyWrittenImages(address, size);
         }
     }
 
