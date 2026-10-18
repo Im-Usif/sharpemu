@@ -545,4 +545,27 @@ public sealed partial class GuestImageCacheTests
         Assert.Empty(harness.ImagesInRange(address, 0x2000));
         harness.Shutdown();
     }
+
+    // A managed write lands through the backing, where no watch sees it, after an upload made the image clean
+    // and watched it again. The memory notifies the image store once more, and the next use uploads the new bytes.
+    [Fact]
+    public void LandedCpuWrite_MarksAnUploadedImageAgain()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address, Bytes(1u, 2u, 3u, 4u));
+        var request = Color32(address, 4);
+        var imageIdentifier = harness.Acquire(ref request);
+        Assert.False(harness.Image(imageIdentifier).IsCpuDirty);
+        Assert.Equal(HostPageProtection.ReadOnly, harness.Protection(address));
+
+        harness.Write(address + 4, Bytes(0x22u));
+        harness.Gpu.MarkCpuWriteLanded(address + 4, 4);
+
+        Assert.True(harness.Image(imageIdentifier).IsDefinitelyCpuDirty);
+        Assert.Equal(imageIdentifier, harness.Acquire(ref request));
+        Assert.Equal(Bytes(1u, 0x22u, 3u, 4u), harness.ReadImageBytes(harness.Image(imageIdentifier)));
+        harness.Shutdown();
+    }
 }

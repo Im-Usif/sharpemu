@@ -610,6 +610,44 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void LandedCpuWrite_MarksAnUploadedPageAgainAndNeverDownloads()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address + 0x40, Pattern(0x100, 1));
+        var (buffer, _) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address + 0x40, 0x4100, isWritten: false));
+        Assert.False(harness.Cache.HasCpuDirtyPages(address, 0x4140));
+        Assert.Equal(HostPageProtection.ReadOnly, harness.Protection(address));
+
+        // A managed write lands through the backing after an upload made the page clean.
+        var landed = Pattern(0x100, 9);
+        harness.Write(address + 0x40, landed);
+        harness.Store.MarkCpuWriteLanded(address + 0x40, 0x100);
+        Assert.True(harness.Cache.HasCpuDirtyPages(address, 0x1000));
+        Assert.Equal(HostPageProtection.ReadWrite, harness.Protection(address));
+        var (again, _) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address + 0x40, 0x4100, isWritten: false));
+        Assert.Same(buffer, again);
+        Assert.Equal(landed, harness.ReadBack(buffer, 0x40, 0x100));
+
+        // On a page the GPU wrote, no download replaces the bytes the write left.
+        var gpuWritten = harness.MapBacked(0x10000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            var (target, offset) = harness.Cache.ObtainBuffer(gpuWritten, 0x40, isWritten: true);
+            target.Fill(offset, 0x40, 0xCAFEF00D);
+        });
+        var cpuBytes = Pattern(8, 0x70);
+        harness.Write(gpuWritten + 8, cpuBytes);
+        harness.Store.MarkCpuWriteLanded(gpuWritten + 8, 8);
+        Assert.True(harness.Cache.HasGpuDirtyPages(gpuWritten, Page));
+        var after = new byte[8];
+        Assert.True(harness.Memory.TryReadBacking(gpuWritten + 8, after));
+        Assert.Equal(cpuBytes, after);
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void UnalignedReadbackAcrossDownloadBatchesPreservesAdjacentGuestBytes()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
@@ -1269,6 +1307,34 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         Assert.False(harness.Cache.IsRegionRegistered(address + 2 * Page, Page));
         Assert.True(harness.Cache.IsRegionRegistered(address + 3 * Page, Page));
         Assert.All(harness.ReadBack(harness.Cache.FaultBuffer, word * 4, 4), value => Assert.Equal(0, value));
+        harness.Shutdown();
+    }
+
+    // A write that landed through the backing marks every page the GPU does not own CPU-dirty, also a page an upload
+    // cleaned in a block where another page is GPU-dirty.
+    [Fact]
+    public void ALandedCpuWriteMarksTheCleanPagesBesideAGpuDirtyPage()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address, BitConverter.GetBytes(1u));
+        harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, 0x5000, isWritten: false));
+        Assert.False(harness.Cache.HasCpuDirtyPages(address, 0x1000));
+        harness.Worker.Run(() =>
+        {
+            var (target, targetOffset) = harness.Cache.ObtainBuffer(address + 0x6000, 0x1000, isWritten: true);
+            target.Fill(targetOffset, 0x1000, 0xCAFEF00D);
+        });
+        Assert.True(harness.Cache.HasGpuDirtyPages(address + 0x6000, 0x1000));
+
+        harness.Write(address, BitConverter.GetBytes(2u));
+        harness.Store.MarkCpuWriteLanded(address, 0x7000);
+
+        Assert.True(harness.Cache.HasCpuDirtyPages(address, 0x1000));
+        Assert.True(harness.Cache.HasGpuDirtyPages(address + 0x6000, 0x1000));
+        var (again, againOffset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, 0x5000, isWritten: false));
+        Assert.Equal(2u, BitConverter.ToUInt32(harness.ReadBack(again, againOffset, 4)));
         harness.Shutdown();
     }
 }

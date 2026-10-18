@@ -145,6 +145,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return tracked && completed;
     }
 
+    // A managed write has landed: pages an upload cleaned between MarkCpuWrite and the write turn
+    // CPU-dirty again. GPU-dirty pages stay as they are, since a download now would replace the new bytes.
+    void IGuestBufferStore.MarkCpuWriteLanded(ulong address, ulong size)
+    {
+        var tracked = _tracker.MarkLandedCpuWrite(address, size);
+        if (GuestGpuMemoryHook.Traces(address, size))
+            GuestGpuMemoryHook.Trace(address, size, $"buffer-write-landed tracked={tracked}");
+    }
+
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
         TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.CpuReadSynchronization);
 

@@ -151,6 +151,22 @@ public sealed class GuestGpuMemory : IDisposable
         return true;
     }
 
+    // A managed write lands through a backing view that no page watch covers, so an upload on the
+    // GPU thread between MarkCpuWrite and the write copies the old bytes and leaves the pages clean
+    // without a fault. Both stores mark those pages again.
+    public void MarkCpuWriteLanded(ulong address, ulong size)
+    {
+        if (!Covers(address, size))
+        {
+            return;
+        }
+
+        // The new bytes must be visible before the store reads its page state.
+        Interlocked.MemoryBarrier();
+        Buffers?.MarkCpuWriteLanded(address, size);
+        _ = Images?.MarkCpuWrite(address, size);
+    }
+
     public bool Covers(ulong address, ulong size)
     {
         if (!new GuestSpan(address, size).IsValid)
