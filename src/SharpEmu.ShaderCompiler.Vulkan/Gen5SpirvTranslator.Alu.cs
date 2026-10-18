@@ -253,14 +253,14 @@ public static partial class Gen5SpirvTranslator
                 case "VCvtF32I32":
                 {
                     var signed = Bitcast(_intType, GetRawSource(instruction, 0));
-                    result = Bitcast(
-                        _uintType,
+                    result = EmitFloatResult(
+                        instruction,
                         _module.AddInstruction(SpirvOp.ConvertSToF, _floatType, signed));
                     break;
                 }
                 case "VCvtF32U32":
-                    result = Bitcast(
-                        _uintType,
+                    result = EmitFloatResult(
+                        instruction,
                         _module.AddInstruction(
                             SpirvOp.ConvertUToF,
                             _floatType,
@@ -274,8 +274,8 @@ public static partial class Gen5SpirvTranslator
                     var shift = (uint)(instruction.Opcode[^1] - '0') * 8;
                     var raw = ShiftRightLogical(GetRawSource(instruction, 0), UInt(shift));
                     raw = BitwiseAnd(raw, UInt(0xFF));
-                    result = Bitcast(
-                        _uintType,
+                    result = EmitFloatResult(
+                        instruction,
                         _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, raw));
                     break;
                 }
@@ -284,7 +284,7 @@ public static partial class Gen5SpirvTranslator
                     var vector = _module.AddInstruction(
                         SpirvOp.CompositeConstruct,
                         _vec2Type,
-                        GetFloatSource(instruction, 0),
+                        ApplyOutputModifiers(instruction, GetFloatSource(instruction, 0)),
                         Float(0));
                     result = BitwiseAnd(Ext(58, _uintType, vector), UInt(0xFFFF));
                     break;
@@ -297,7 +297,7 @@ public static partial class Gen5SpirvTranslator
                         _floatType,
                         unpacked,
                         0);
-                    result = Bitcast(_uintType, value);
+                    result = EmitFloatResult(instruction, value);
                     break;
                 }
                 case "VCvtOffF32I4":
@@ -5680,19 +5680,13 @@ public static partial class Gen5SpirvTranslator
             uint value)
         {
             var control = instruction.Control as Gen5Vop3Control;
-            value = (control?.OutputModifier ?? 0) switch
+            var half = EmitFloatToHalf(EmitFloatResult(instruction, value));
+            if (instruction.Control is Gen5SdwaControl)
             {
-                1 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(2)),
-                2 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(4)),
-                3 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(0.5f)),
-                _ => value,
-            };
-            if (control?.Clamp == true)
-            {
-                value = Ext(81, _floatType, value, Float(0), Float(1));
+                // The SDWA word picks the field that takes the half and what becomes of the rest of the register.
+                return half;
             }
 
-            var half = EmitFloatToHalf(Bitcast(_uintType, value));
             var current = LoadV(destination);
             return ((control?.OperandSelect ?? 0) & 8) != 0
                 ? BitwiseOr(
@@ -5704,6 +5698,11 @@ public static partial class Gen5SpirvTranslator
         }
 
         private uint EmitFloatResult(
+            Gen5ShaderInstruction instruction,
+            uint value) =>
+            Bitcast(_uintType, ApplyOutputModifiers(instruction, value));
+
+        private uint ApplyOutputModifiers(
             Gen5ShaderInstruction instruction,
             uint value)
         {
@@ -5733,7 +5732,7 @@ public static partial class Gen5SpirvTranslator
                 value = Ext(81, _floatType, value, Float(0), Float(1));
             }
 
-            return Bitcast(_uintType, value);
+            return value;
         }
 
         private uint TruncateFloat32ForPack(uint value)

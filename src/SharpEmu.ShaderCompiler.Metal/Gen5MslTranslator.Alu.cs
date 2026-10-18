@@ -273,9 +273,9 @@ public static partial class Gen5MslTranslator
                 "VCvtF32Ubyte2" => FloatResult(instruction, $"(float)((({RawSource(instruction, 0)}) >> 16) & 0xFFu)"),
                 "VCvtF32Ubyte3" => FloatResult(instruction, $"(float)((({RawSource(instruction, 0)}) >> 24) & 0xFFu)"),
                 "VCvtF16F32" =>
-                    $"((uint)as_type<ushort>(half({F(instruction, 0)})))",
+                    $"((uint)as_type<ushort>(half({ApplyOutputModifiers(instruction, F(instruction, 0))})))",
                 "VCvtF32F16" =>
-                    AsUInt($"(float)as_type<half>((ushort)(({RawSource(instruction, 0)}) & 0xFFFFu))"),
+                    FloatResult(instruction, $"(float)as_type<half>((ushort)(({RawSource(instruction, 0)}) & 0xFFFFu))"),
                 "VCvtOffF32I4" =>
                     AsUInt($"sharpemu_off_i4_table[({RawSource(instruction, 0)}) & 15u]"),
                 "VCvtPkU8F32" =>
@@ -2024,26 +2024,22 @@ public static partial class Gen5MslTranslator
             return signed ? $"int(short({half}))" : half;
         }
 
-        /// <summary>Rounds to f16 and preserves the unselected VGPR half.</summary>
+        /// <summary>
+        /// Rounds to f16 and preserves the unselected VGPR half. An SDWA word picks the field and what
+        /// becomes of the rest of the register itself.
+        /// </summary>
         private string Float16Result(
             Gen5ShaderInstruction instruction,
             uint destination,
             string expression)
         {
             var control = instruction.Control as Gen5Vop3Control;
-            expression = (control?.OutputModifier ?? 0) switch
+            var packed = $"(uint)as_type<ushort>(half({ApplyOutputModifiers(instruction, expression)}))";
+            if (instruction.Control is Gen5SdwaControl)
             {
-                1 => $"(({expression}) * 2.0f)",
-                2 => $"(({expression}) * 4.0f)",
-                3 => $"(({expression}) * 0.5f)",
-                _ => expression,
-            };
-            if (control?.Clamp == true)
-            {
-                expression = $"clamp({expression}, 0.0f, 1.0f)";
+                return $"({packed})";
             }
 
-            var packed = $"(uint)as_type<ushort>(half({expression}))";
             return ((control?.OperandSelect ?? 0) & 8) != 0
                 ? $"((v[{destination}] & 0x0000FFFFu) | (({packed}) << 16))"
                 : $"((v[{destination}] & 0xFFFF0000u) | ({packed}))";
@@ -2053,7 +2049,10 @@ public static partial class Gen5MslTranslator
         /// Wraps a float expression with VOP3/SDWA output modifiers and clamp,
         /// then bitcasts back to the register file's uint domain.
         /// </summary>
-        private string FloatResult(Gen5ShaderInstruction instruction, string expression)
+        private string FloatResult(Gen5ShaderInstruction instruction, string expression) =>
+            AsUInt($"({ApplyOutputModifiers(instruction, expression)})");
+
+        private static string ApplyOutputModifiers(Gen5ShaderInstruction instruction, string expression)
         {
             var (outputModifier, clamp) = instruction.Control switch
             {
@@ -2073,7 +2072,7 @@ public static partial class Gen5MslTranslator
                 expression = $"clamp({expression}, 0.0f, 1.0f)";
             }
 
-            return AsUInt($"({expression})");
+            return expression;
         }
 
         /// <summary>The lane's bit of a mask operand (VCC/EXEC/SGPR mask).</summary>
