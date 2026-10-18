@@ -255,7 +255,8 @@ public static partial class Gen5SpirvTranslator
             uint Type,
             Gen5PixelOutputKind Kind,
             Gen5ColorComponentMapping ComponentMapping,
-            uint DualSourceAlphaVariable = 0);
+            uint DualSourceAlphaVariable = 0,
+            Gen5PixelExportFormat ExportFormat = Gen5PixelExportFormat.Float16);
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error, ref ShaderTranslationProfile.Scope profile)
         {
@@ -1057,7 +1058,8 @@ public static partial class Gen5SpirvTranslator
                             outputType,
                             binding.Kind,
                             binding.ComponentMapping,
-                            alphaVariable));
+                            alphaVariable,
+                            binding.ExportFormat));
                     _interfaces.Add(variable);
                 }
             }
@@ -6904,7 +6906,9 @@ public static partial class Gen5SpirvTranslator
                     {
                         if (output.Kind == Gen5PixelOutputKind.Float)
                         {
-                            values[component] = LoadCompressedExportComponent(instruction, component);
+                            values[component] = output.ExportFormat is Gen5PixelExportFormat.Unorm16 or Gen5PixelExportFormat.Snorm16
+                                ? LoadNormalizedExportComponent(instruction, component, output.ExportFormat == Gen5PixelExportFormat.Snorm16)
+                                : LoadCompressedExportComponent(instruction, component);
                         }
                         else
                         {
@@ -7775,6 +7779,13 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
                    _request.Program.Address == address;
+        }
+
+        // A compressed export to a UNORM16 or SNORM16 format carries two normalized 16-bit values per register.
+        private uint LoadNormalizedExportComponent(Gen5ShaderInstruction instruction, int component, bool signed)
+        {
+            var unpacked = Ext(signed ? 60u : 61u, _vec2Type, LoadV(instruction.Sources[component >> 1].Value));
+            return _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, unpacked, (uint)(component & 1));
         }
 
         private uint LoadCompressedExportComponent(

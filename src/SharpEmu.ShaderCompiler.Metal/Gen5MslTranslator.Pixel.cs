@@ -579,7 +579,12 @@ public static partial class Gen5MslTranslator
                 if (export.Compressed)
                 {
                     var packed = $"v[{instruction.Sources[component >> 1].Value}]";
-                    var half = $"(float)as_type<half2>({packed})[{component & 1}]";
+                    var half = binding.Value.ExportFormat switch
+                    {
+                        Gen5PixelExportFormat.Unorm16 => $"(float(as_type<ushort2>({packed})[{component & 1}]) / 65535.0f)",
+                        Gen5PixelExportFormat.Snorm16 => $"max(float(as_type<short2>({packed})[{component & 1}]) / 32767.0f, -1.0f)",
+                        _ => $"(float)as_type<half2>({packed})[{component & 1}]",
+                    };
                     values[component] = binding.Value.Kind switch
                     {
                         Gen5PixelOutputKind.Uint => $"uint(as_type<ushort2>({packed})[{component & 1}])",
