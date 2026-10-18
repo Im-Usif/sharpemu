@@ -1549,11 +1549,7 @@ public static class AvPlayerExports
             $"replacement_file open object=0x{player.FileObject:X16} " +
             $"callback=0x{player.FileOpenCallback:X16} result={unchecked((int)openResult)}");
 
-        var materializedPath = Path.Combine(
-            Path.GetTempPath(),
-            "SharpEmu",
-            "AvPlayer",
-            Path.GetRandomFileName());
+        var materializedPath = Path.Combine(MaterializedSourceFolder.Value, Path.GetRandomFileName());
         var hostBuffer = ArrayPool<byte>.Shared.Rent(ReplacementFileReadBufferSize);
         try
         {
@@ -1654,6 +1650,65 @@ public static class AvPlayerExports
             {
                 TryDeleteMaterializedSource(materializedPath);
             }
+        }
+    }
+
+    // A process keeps its copies in a folder named after its id. A copy is deleted when the title
+    // closes its player, which never happens when the process is ended, so the first copy of a
+    // process removes the folders of processes that no longer run.
+    private static readonly Lazy<string> MaterializedSourceFolder = new(() =>
+    {
+        var root = Path.Combine(Path.GetTempPath(), "SharpEmu", "AvPlayer");
+        RemoveCopiesOfEndedProcesses(root);
+        return Path.Combine(root, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+    });
+
+    internal static void RemoveCopiesOfEndedProcesses(string root)
+    {
+        string[] folders;
+        try
+        {
+            if (!Directory.Exists(root))
+            {
+                return;
+            }
+
+            folders = Directory.GetDirectories(root);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        foreach (var folder in folders)
+        {
+            if (!int.TryParse(Path.GetFileName(folder), NumberStyles.None, CultureInfo.InvariantCulture, out var processId) ||
+                processId == Environment.ProcessId || IsRunning(processId))
+            {
+                continue;
+            }
+
+            // A copy still open elsewhere (a scanner, say) keeps its folder; the others still go.
+            try
+            {
+                Directory.Delete(folder, recursive: true);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    private static bool IsRunning(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
         }
     }
 
