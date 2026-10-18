@@ -6,6 +6,7 @@ using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Tests.Gpu.Buffers;
+using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Memory.GuestMemory;
 using Silk.NET.Vulkan;
 using Xunit;
@@ -223,6 +224,115 @@ public sealed unsafe partial class GuestImageCacheTests
             Assert.True(harness.Image(depthId).IsGpuModified);
             harness.Scheduler.Finish();
         });
+        harness.Shutdown();
+    }
+
+    // A tiled array's mip layout ends before its tile plan does: each level spans its size times the layer count from
+    // its offset in the first slice, while every 64 KiB slice holds a whole chain with the base level last. A buffer
+    // over the whole image takes every tile; a buffer that ends inside the last tile keeps the guest bytes.
+    [Fact]
+    public unsafe void BufferSynchronization_CoversTheWholeTilePlanOfAnArray()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var harness = new CacheHarness(_vulkan);
+        const uint width = 128, levels = 8, layers = 64;
+        const GuestPixelFormat guestFormat = GuestPixelFormat.Bits32_32_32_32UInt;
+        var size = TileGeometry.TextureTotalSize(guestFormat, width, width, layers, levels, GuestTileMode.Standard64KB, false).Size;
+        var address = harness.MapBacked(size, ReadWrite);
+        var request = LinearRequest(address, size, Format.R32G32B32A32Uint, guestFormat, GuestImageType.Color2D, new Extent3D(width, width, 1), layers, 16, 1);
+        request.Description.TileMode = GuestTileMode.Standard64KB;
+        request.Description.Pitch = TileGeometry.TexturePitch(guestFormat, width, GuestTileMode.Standard64KB);
+        request.Description.Resources = new SubresourceCount(levels, layers);
+        request.View = request.View with { LevelCount = levels };
+        ImageRequestBuilders.PopulateTextureMipLayout(ref request.Description);
+        var layoutEnd = 0UL;
+        for (var level = 0; level < levels; level++)
+        {
+            layoutEnd = Math.Max(layoutEnd, request.Description.MipLayout[level].Offset + request.Description.MipLayout[level].Size);
+        }
+
+        // The layout of the image whose download aborted the process: tiles of layers 43-63 lay past 0x1020000.
+        Assert.Equal(0x1800000UL, size);
+        Assert.Equal(0x1020000UL, layoutEnd);
+        var identifier = harness.Acquire(ref request);
+        var image = harness.Image(identifier);
+        uint[] texel = [0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00];
+        harness.Worker.Run(() =>
+        {
+            var command = new CommandBuffer(harness.Scheduler.Current.Handle);
+            image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+            var clear = new ClearColorValue { Uint32_0 = texel[0], Uint32_1 = texel[1], Uint32_2 = texel[2], Uint32_3 = texel[3] };
+            var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, levels, 0, layers);
+            harness.Vulkan.Vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range);
+        });
+        harness.MarkGpuWritten(identifier);
+        harness.Worker.Run(() =>
+        {
+            using var partial = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, size - 16);
+            Assert.False(harness.Images.TrySynchronizeBufferFromImage(partial, address, size - 16));
+            using var full = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, size);
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(full, address, size));
+            var lastTile = harness.CopyFromDevice(full.Handle, size - 0x40000, 0x40000);
+            Assert.Equal(Bytes(Enumerable.Range(0, 0x4000).SelectMany(_ => texel).ToArray()), lastTile);
+        });
+        Assert.Empty(fatal.Messages);
+        harness.Shutdown();
+    }
+
+    // A linear array's copy regions follow its slice stride, past the end of its mip layout (each level spans its
+    // size times the layer count from its offset in the first slice). A buffer over the whole image takes every slice;
+    // a buffer that holds only the mip layout keeps the guest bytes instead of a copy past its end.
+    [Fact]
+    public unsafe void BufferSynchronization_CoversTheCopyRegionsOfALinearArray()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var harness = new CacheHarness(_vulkan);
+        const uint width = 64, levels = 7, layers = 4;
+        const GuestPixelFormat guestFormat = GuestPixelFormat.Bits8_8_8_8UNorm;
+        var size = TileGeometry.TextureTotalSize(guestFormat, width, width, layers, levels, GuestTileMode.Linear, false).Size;
+        var address = harness.MapBacked((size + 0xFFFF) & ~0xFFFFUL, ReadWrite);
+        var request = LinearRequest(address, size, Format.R8G8B8A8Unorm, guestFormat, GuestImageType.Color2D, new Extent3D(width, width, 1), layers, 4, 1);
+        request.Description.TileMode = GuestTileMode.Linear;
+        request.Description.Pitch = TileGeometry.TexturePitch(guestFormat, width, GuestTileMode.Linear);
+        request.Description.Resources = new SubresourceCount(levels, layers);
+        request.View = request.View with { LevelCount = levels };
+        ImageRequestBuilders.PopulateTextureMipLayout(ref request.Description);
+        var layoutEnd = 0UL;
+        for (var level = 0; level < levels; level++)
+        {
+            layoutEnd = Math.Max(layoutEnd, request.Description.MipLayout[level].Offset + request.Description.MipLayout[level].Size);
+        }
+
+        Assert.True(layoutEnd < size);
+        var identifier = harness.Acquire(ref request);
+        var image = harness.Image(identifier);
+        harness.Worker.Run(() =>
+        {
+            var command = new CommandBuffer(harness.Scheduler.Current.Handle);
+            image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+            var clear = new ClearColorValue { Uint32_0 = 0, Uint32_1 = 0, Uint32_2 = 0, Uint32_3 = 0 };
+            clear.Float32_0 = 1f;
+            var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, levels, 0, layers);
+            harness.Vulkan.Vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range);
+        });
+        harness.MarkGpuWritten(identifier);
+        harness.Worker.Run(() =>
+        {
+            using var partial = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, layoutEnd);
+            Assert.False(harness.Images.TrySynchronizeBufferFromImage(partial, address, layoutEnd));
+            using var full = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, size);
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(full, address, size));
+            // The base level of the last layer, where the transfer layout puts it: every texel is (1, 0, 0, 0).
+            var layout = TextureTransferLayout.Compute(guestFormat, width, width, levels, layers, GuestTileMode.Linear, size,
+                allowDepthTile: false, volume: false, "test");
+            Assert.True(layout.Mips[0].Offset + (layers - 1) * layout.SliceStride + width * width * 4 > layoutEnd);
+            var lastLayer = harness.CopyFromDevice(full.Handle, layout.Mips[0].Offset + (layers - 1) * layout.SliceStride, width * width * 4);
+            Assert.All(Enumerable.Range(0, (int)(width * width)), texel =>
+                Assert.Equal(0x000000FFu, BitConverter.ToUInt32(lastLayer, texel * 4)));
+        });
+        Assert.Empty(fatal.Messages);
         harness.Shutdown();
     }
 
