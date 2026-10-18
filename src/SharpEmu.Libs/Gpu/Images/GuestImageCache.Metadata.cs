@@ -310,6 +310,18 @@ public sealed partial class GuestImageCache
         return _metadataWriteRanges.Overlaps(address, size);
     }
 
+    // A target that binds metadata of another kind where a registration lies ends the use of the surface that
+    // registered it: the guest reused that memory. The new kind starts as at an address nothing registered.
+    private SurfaceMetadata ReplaceSurfaceMetadata(ulong address, SurfaceMetadata previous, SurfaceMetadata replacement)
+    {
+        RecordMetadataEvent("replace-other-kind", address);
+        previous.ClearMask = 0;
+        previous.FillSize = 0;
+        previous.Invalidated = true;
+        _surfaceMetadata[address] = replacement;
+        return replacement;
+    }
+
     private void InvalidateMetadataForCpuWrite(ulong address, ulong size)
     {
         if (_surfaceMetadata.Count == 0 || !MayOverlapMetadata(address, size)) return;

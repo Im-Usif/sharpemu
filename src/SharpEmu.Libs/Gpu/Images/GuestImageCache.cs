@@ -448,7 +448,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
             else if (metadata.Kind != SurfaceMetadataKind.Dcc)
             {
-                throw SubmissionScheduler.Fatal($"A color target reuses metadata that is not DCC: address=0x{address:X16} kind={metadata.Kind}.");
+                metadata = ReplaceSurfaceMetadata(address, metadata, new SurfaceMetadata { Kind = SurfaceMetadataKind.Dcc });
             }
 
             metadata.Size = Math.Max(metadata.Size, request.Description.DccSliceSize * request.Description.TransferLayers);
@@ -510,7 +510,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
             else if (metadata.Kind != SurfaceMetadataKind.HTile)
             {
-                throw SubmissionScheduler.Fatal($"A depth target reuses metadata that is not HTile: address=0x{address:X16} kind={metadata.Kind}.");
+                metadata = ReplaceSurfaceMetadata(address, metadata,
+                    new SurfaceMetadata { Kind = SurfaceMetadataKind.HTile, ClearMask = image.Description.HtileClearMask });
             }
             metadata.RangeSize = Math.Max(metadata.RangeSize, request.Description.Metadata.Range.Size);
             image.MetadataRegistration = metadata;

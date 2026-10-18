@@ -112,6 +112,74 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A depth target whose HTile lands where a color target kept its DCC ends that use: the HTile takes the
+    // address, and deleting the color target later leaves it.
+    [Fact]
+    public void DepthTarget_ReplacesTheDccOfAnotherSurfaceAtItsHtileAddress()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var metadataAddress = address + 0x10000;
+        var color = AsColorTarget(LinearRequest(address + 0x4000, 4, Format.R8G8B8A8Srgb,
+            GuestPixelFormat.Bits8_8_8_8Srgb, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1));
+        color.Description.Metadata.Kind = MetadataKind.Dcc;
+        // A zero range size selects deferred metadata registration.
+        color.Description.Metadata.Range = new GuestSpan(metadataAddress, 0);
+        color.Description.Metadata.Compression = DisplayCompression.Dcc256_256_0;
+        color.Description.TileMode = GuestTileMode.RenderTarget;
+        var colorIdentifier = harness.Acquire(ref color);
+        Assert.True(harness.Images.OverlapsDccMetadata(metadataAddress, 1));
+
+        var depth = AsDepthTarget(LinearRequest(address + 0x8000, 4, Format.D32Sfloat,
+            GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1), Format.D32Sfloat);
+        depth.Description.Metadata.Kind = MetadataKind.Htile;
+        depth.Description.Metadata.Range = new GuestSpan(metadataAddress, 0x100);
+        harness.Acquire(ref depth);
+
+        Assert.True(harness.Images.IsMetadata(metadataAddress));
+        Assert.False(harness.Images.OverlapsDccMetadata(metadataAddress, 1));
+        Assert.True(harness.Images.IsMetadataCleared(metadataAddress, 0));
+        harness.Worker.Run(() =>
+        {
+            harness.Image(colorIdentifier).ClearGpuModified();
+            harness.Images.DeleteImageForTest(colorIdentifier);
+        });
+        Assert.True(harness.Images.IsMetadata(metadataAddress));
+        Assert.True(harness.Images.ClearMetadata(metadataAddress));
+        harness.Shutdown();
+    }
+
+    // A color target whose DCC lands where a depth target kept its HTile takes the address the same way.
+    [Fact]
+    public void ColorTarget_ReplacesTheHtileOfAnotherSurfaceAtItsDccAddress()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var metadataAddress = address + 0x10000;
+        var depth = AsDepthTarget(LinearRequest(address + 0x8000, 4, Format.D32Sfloat,
+            GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1), Format.D32Sfloat);
+        depth.Description.Metadata.Kind = MetadataKind.Htile;
+        depth.Description.Metadata.Range = new GuestSpan(metadataAddress, 0x100);
+        harness.Acquire(ref depth);
+        Assert.True(harness.Images.ClearMetadata(metadataAddress));
+
+        var color = AsColorTarget(LinearRequest(address + 0x4000, 4, Format.R8G8B8A8Srgb,
+            GuestPixelFormat.Bits8_8_8_8Srgb, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1));
+        color.Description.Metadata.Kind = MetadataKind.Dcc;
+        // A zero range size selects deferred metadata registration.
+        color.Description.Metadata.Range = new GuestSpan(metadataAddress, 0);
+        color.Description.Metadata.Compression = DisplayCompression.Dcc256_256_0;
+        color.Description.TileMode = GuestTileMode.RenderTarget;
+        harness.Acquire(ref color);
+
+        Assert.True(harness.Images.OverlapsDccMetadata(metadataAddress, 1));
+        Assert.False(harness.Images.IsMetadataCleared(metadataAddress, 0));
+        Assert.False(harness.Images.ClearMetadata(metadataAddress));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void CpuWriteInvalidatesTheExpandedPendingDccFill()
     {
