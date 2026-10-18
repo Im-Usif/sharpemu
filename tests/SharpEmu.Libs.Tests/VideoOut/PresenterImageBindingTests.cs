@@ -36,6 +36,53 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFixture>
 {
     private const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    private static int RefindStaleBindings(bool[] stale, Action<int, bool> findAgain) =>
+        (int)PresenterType.GetMethod("RefindStaleBindings", BindingFlags.Static | BindingFlags.NonPublic)!
+            .Invoke(null, [stale.Length, (Func<int, bool>)(index => stale[index]), findAgain])!;
+
+    // Two bindings over the same memory whose images replace each other whenever one is found
+    // again: one of them ends as a null image instead of a fatal.
+    [Fact]
+    public void StaleBindings_ThatKeepReplacingEachOther_EndWithANullImage()
+    {
+        var stale = new[] { true, true };
+        var asNull = new bool[2];
+        var nulled = RefindStaleBindings(stale, (index, toNull) =>
+        {
+            stale[index] = false;
+            asNull[index] |= toNull;
+            if (!toNull)
+            {
+                stale[1 - index] = true;
+            }
+        });
+
+        Assert.Equal(1, nulled);
+        Assert.Equal([true, false], asNull);
+        Assert.Equal([false, false], stale);
+    }
+
+    // A binding replaced once by a later one is found again without a null image.
+    [Fact]
+    public void StaleBindings_ReplacedOnce_AreFoundAgain()
+    {
+        var stale = new[] { true, false };
+        var replaced = false;
+        var nulled = RefindStaleBindings(stale, (index, toNull) =>
+        {
+            Assert.False(toNull);
+            stale[index] = false;
+            if (index == 0 && !replaced)
+            {
+                replaced = true;
+                stale[1] = true;
+            }
+        });
+
+        Assert.Equal(0, nulled);
+        Assert.Equal([false, false], stale);
+    }
     private static readonly Type PresenterType = typeof(VulkanVideoPresenter).GetNestedType("Presenter", BindingFlags.NonPublic)!;
     private static readonly Type ColorAttachmentType = typeof(VulkanVideoPresenter).GetNestedType("ColorAttachment", BindingFlags.NonPublic)!;
     private static readonly Type TextureResourceType = typeof(VulkanVideoPresenter).GetNestedType("TextureResource", BindingFlags.NonPublic)!;

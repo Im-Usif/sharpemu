@@ -827,6 +827,44 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private const int MaxRebindPasses = 3;
+        private static readonly uint[] NullImageWords = new uint[8];
+        private static int _nullRebindReports;
+
+        // Finding an image again can replace another image of the same dispatch: two bindings over
+        // the same memory with layouts one cached image cannot hold at once, where the guest reads
+        // two views of one memory. The stale bindings are found again until none is left; one still
+        // losing its image after MaxRebindPasses reads as a null image. Returns how many did.
+        internal static int RefindStaleBindings(int count, Func<int, bool> isStale, Action<int, bool> findAgain)
+        {
+            var nulled = 0;
+            for (var pass = 0; ; pass++)
+            {
+                var refound = false;
+                for (var index = 0; index < count; index++)
+                {
+                    if (!isStale(index))
+                    {
+                        continue;
+                    }
+
+                    if (pass > MaxRebindPasses)
+                    {
+                        throw SubmissionScheduler.Fatal($"An image binding is stale after it was bound as a null image: image={index}.");
+                    }
+
+                    nulled += pass == MaxRebindPasses ? 1 : 0;
+                    findAgain(index, pass == MaxRebindPasses);
+                    refound = true;
+                }
+
+                if (!refound)
+                {
+                    return nulled;
+                }
+            }
+        }
+
         // Views for every image after the targets are bound; a stale image is found again first.
         private void BindImages(PreparedStageBindings prepared)
         {
@@ -834,23 +872,21 @@ internal static unsafe partial class VulkanVideoPresenter
             var info = prepared.Resources.Info;
             var snapshot = prepared.Stage.Resources;
             var images = prepared.Descriptors.Images;
-            for (var index = 0; index < images.Length; index++)
-            {
-                var binding = images[index];
-                if (binding.IsHostMovie)
+            var nulled = RefindStaleBindings(
+                images.Length,
+                index => !images[index].IsHostMovie && IsStaleImage(images[index].ImageIdentifier, out _),
+                (index, asNull) =>
                 {
-                    continue;
-                }
-
-                if (IsStaleImage(binding.ImageIdentifier, out var stale))
-                {
-                    if (stale is not null)
+                    if (_imageCache.TryGetImage(images[index].ImageIdentifier, out var stale))
                     {
                         stale.Binding = default;
                     }
 
-                    images[index] = binding = ResolveImageBinding(info.Images[index], snapshot.Images[index], program, index);
-                }
+                    images[index] = ResolveImageBinding(info.Images[index], asNull ? NullImageWords : snapshot.Images[index], program, index);
+                });
+            if (nulled != 0 && Interlocked.Increment(ref _nullRebindReports) <= 32)
+            {
+                Console.Error.WriteLine($"[GPU][WARN] {nulled} image binding(s) of 0x{program.Hash:X16} kept losing their image to another binding over the same memory; they read as null images");
             }
 
             for (var index = 0; index < images.Length; index++)
