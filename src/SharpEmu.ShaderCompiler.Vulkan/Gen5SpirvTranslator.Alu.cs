@@ -3708,6 +3708,24 @@ public static partial class Gen5SpirvTranslator
                                     Bitcast(_intType, left),
                                     Bitcast(_intType, right)));
                             break;
+                        case "SAbsdiffI32":
+                        {
+                            // The difference wraps, so the magnitude of the most
+                            // negative value stays negative like on the hardware.
+                            var difference = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+                            var sign = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                UInt(0),
+                                ShiftRightLogical(difference, UInt(31)));
+                            result = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                _module.AddInstruction(SpirvOp.BitwiseXor, _uintType, difference, sign),
+                                sign);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        }
                         case "SLshl1AddU32":
                         case "SLshl2AddU32":
                         case "SLshl3AddU32":
