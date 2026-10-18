@@ -2987,20 +2987,17 @@ public static partial class Gen5SpirvTranslator
                     control.SingleOffsetBytes);
                 EmitExecConditional(() =>
                 {
-                    var original = Load(_uintType, maskedPointer);
-                    var updated = BitwiseOr(
-                        BitwiseAnd(
-                            original,
-                            _module.AddInstruction(
-                                SpirvOp.Not,
-                                _uintType,
-                                GetRawSource(instruction, 1))),
-                        GetRawSource(instruction, 2));
-                    EmitLdsAtomic(
-                        SpirvOp.AtomicCompareExchange,
-                        maskedPointer,
-                        value: () => updated,
-                        comparator: () => original);
+                    var keep = _module.AddInstruction(SpirvOp.Not, _uintType, GetRawSource(instruction, 1));
+                    var data = GetRawSource(instruction, 2);
+                    uint Merge(uint observed) => BitwiseOr(BitwiseAnd(observed, keep), data);
+                    if (_ldsPrivate)
+                    {
+                        Store(maskedPointer, Merge(Load(_uintType, maskedPointer)));
+                        return;
+                    }
+
+                    // One compare-exchange loop per lane: lanes that mask the same word each keep their update.
+                    EmitAtomicWordUpdate(maskedPointer, Merge, scope: 2);
                 });
                 return true;
             }

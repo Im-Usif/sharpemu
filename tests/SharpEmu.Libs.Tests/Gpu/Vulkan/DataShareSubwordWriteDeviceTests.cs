@@ -13,7 +13,7 @@ using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
 
 namespace SharpEmu.Libs.Tests.Gpu.Vulkan;
 
-// DS_WRITE_B8 and DS_WRITE_B16 on the LDS a workgroup shares.
+// DS_WRITE_B8, DS_WRITE_B16 and DS_MSKOR_B32 on the LDS a workgroup shares.
 public sealed class DataShareSubwordWriteDeviceTests(HeadlessVulkanFixture fixture, ITestOutputHelper output) : IClassFixture<HeadlessVulkanFixture>
 {
     private const uint ResultRegister = 4;
@@ -61,6 +61,39 @@ public sealed class DataShareSubwordWriteDeviceTests(HeadlessVulkanFixture fixtu
         var word = BinaryPrimitives.ReadUInt32LittleEndian(runner.ReadBack(result, 0, ResultBytes));
         output.WriteLine($"{opcode}: lanes stored 0x{lane0Value:X} and 0x{lane1Value:X}; LDS word = 0x{word:X8}");
         Assert.Contains(word & fieldMask, new[] { lane0Value, lane1Value });
+    }
+
+    // Every lane of a wave masks its own bit into one LDS word: each update lands, as the hardware applies them one
+    // after another.
+    [Fact]
+    public void LanesMaskingOneWord_EachKeepTheirBit()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var program = Program(
+            MoveVector(0, 1, 0),                                   // v1 = LDS address 0 (and the store offset)
+            MoveVector(8, 3, 1),
+            Vop2(16, "VLshlrevB32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(3)), // v2 = 1 << lane
+            MoveVector(24, 4, 0),
+            DataShare(32, "DsWriteB32", false, [Gen5Operand.Vector(1), Gen5Operand.Vector(4)], []),
+            Barrier(40),
+            DataShare(44, "DsMskorB32", false, [Gen5Operand.Vector(1), Gen5Operand.Vector(2), Gen5Operand.Vector(2)], []),
+            Barrier(52),
+            DataShare(56, "DsReadB32", false, [Gen5Operand.Vector(1)], [4]),
+            BufferAccess(64, "BufferStoreDword", ResultRegister, 0, 1, vectorData: 4, offsetEnabled: true, vectorAddress: 1),
+            EndProgram(72));
+        var (plan, resources, layout) = Prepare(program);
+        var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 32, ThreadCountX = 32, WaveSize = 32 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        using var harness = new ImageTestHarness(vulkan);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv);
+        var result = runner.CreateBuffer(ResultBytes);
+        var registers = new uint[256];
+        registers[ResultRegister + 2] = ResultBytes;
+        harness.Run(() => runner.Dispatch(registers,
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [result] }, 1));
+        Assert.Equal(uint.MaxValue, BinaryPrimitives.ReadUInt32LittleEndian(runner.ReadBack(result, 0, ResultBytes)));
     }
 
     // The sub-dword reads extract and extend the field the address selects, the D16 forms fill one half and keep the
