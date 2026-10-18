@@ -35,6 +35,8 @@ public sealed partial class GuestImageCache
         return !exactFormat || cached.PixelFormat == requested.PixelFormat;
     }
 
+    // A block-compressed image is never a target or a display surface: its guest bytes keep the texture
+    // layout, also when it grew out of a target of the same memory and took that target's uses.
     private static ImageRole UploadRole(CachedImage image)
     {
         if (image.Description.IsDepth)
@@ -42,12 +44,12 @@ public sealed partial class GuestImageCache
             return ImageRole.DepthTarget;
         }
 
-        if (image.Uses.RenderTarget)
+        if (image.Uses.RenderTarget && !image.Description.IsBlock)
         {
             return ImageRole.ColorTarget;
         }
 
-        if (image.Uses.VideoOut)
+        if (image.Uses.VideoOut && !image.Description.IsBlock)
         {
             return ImageRole.DisplaySurface;
         }
@@ -573,7 +575,7 @@ public sealed partial class GuestImageCache
             ? source.Description.Resources.Layers : 0;
         try
         {
-            PopulateFromGuest(expandedImageIdentifier, ImageRequest.Refresh(description, UploadRole(source)),
+            PopulateFromGuest(expandedImageIdentifier, ImageRequest.Refresh(description, UploadRole(expanded)),
                 firstLayer == 0 ? "expand" : "expand-partial", firstLayer);
             var mip = source.Description.FindMatchingMipLevel(description);
             var layer = source.Description.FindMatchingArraySlice(description, mip);

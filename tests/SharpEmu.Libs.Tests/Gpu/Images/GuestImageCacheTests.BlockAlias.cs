@@ -110,6 +110,41 @@ public sealed partial class GuestImageCacheTests
         Assert.True(harness.Image(aliasId).Description.IsBlock);
     }
 
+    // A render target whose pixels are as large as the blocks of a compressed texture the guest later puts in the
+    // same memory (8 bytes: R16G16B16A16 pixels, BC1 blocks). The texture grows out of the target and takes its uses,
+    // but its guest bytes have the texture layout: planning them as a colour target stopped the game.
+    [Fact]
+    public void FindImage_ACompressedTextureGrownFromAColorTargetUploadsWithTheTextureLayout()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        // Linear rows are 256 bytes: 32 pixels of the 16x16 target, 32 blocks of the 64x64 texture (16 used).
+        const ulong paddedBytes = 0x1000;
+        var target = AsColorTarget(LinearRequest(address, paddedBytes, Format.R16G16B16A16Uint, GuestPixelFormat.Bits16_16_16_16UInt,
+            GuestImageType.Color2D, new Extent3D(16, 16, 1), 1, 8, 1));
+        var targetId = harness.Acquire(ref target);
+        Assert.True(harness.Image(targetId).Uses.RenderTarget);
+
+        var texture = LinearRequest(address, paddedBytes, Format.BC1RgbaSrgbBlock, GuestPixelFormat.Bc1Srgb, GuestImageType.Color2D,
+            new Extent3D(64, 64, 1), 1, 8, 1);
+        var textureId = harness.Acquire(ref texture);
+
+        Assert.Equal(new[] { textureId }, harness.Images.FindImagesInRangeForTest(address, paddedBytes, pageOverlap: false));
+        Assert.True(harness.Image(textureId).Description.IsBlock);
+        Assert.False(harness.Image(textureId).IsCpuDirty);
+
+        // The CPU streams new blocks into the texture; the refresh uploads them with the texture layout too.
+        var blocks = Enumerable.Range(0, (int)paddedBytes).Select(index => (byte)(index * 7 + index / 256)).ToArray();
+        Assert.True(harness.WriteFault(address));
+        harness.Write(address, blocks);
+        harness.Worker.Run(() => harness.Images.RefreshImage(textureId));
+        Assert.False(harness.Image(textureId).IsCpuDirty);
+        var rows = Enumerable.Range(0, 16).SelectMany(row => blocks.Skip(row * 256).Take(16 * 8)).ToArray();
+        Assert.Equal(rows, harness.ReadImageBytes(harness.Image(textureId))[..(int)BlockImageBytes]);
+        harness.Shutdown();
+    }
+
     [Fact]
     public void FindImage_ACompressedImageSurvivesABlockAliasRoundTrip()
     {
