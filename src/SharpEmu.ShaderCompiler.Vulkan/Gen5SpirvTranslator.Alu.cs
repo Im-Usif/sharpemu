@@ -898,8 +898,8 @@ public static partial class Gen5SpirvTranslator
                     // products are accumulated in f32 on top of the previous
                     // value of the destination.  Only the clamp of the
                     // encoding limits the result.
-                    var left = GetRawSource(instruction, 0);
-                    var right = GetRawSource(instruction, 1);
+                    var left = GetPackedF16Source(instruction, 0);
+                    var right = GetPackedF16Source(instruction, 1);
                     var lowProduct = _module.AddInstruction(
                         SpirvOp.FMul,
                         _floatType,
@@ -2283,12 +2283,30 @@ public static partial class Gen5SpirvTranslator
             uint accumulator,
             bool highLane)
         {
-            var left = EmitPackedF16Half(GetRawSource(instruction, 0), highLane);
-            var right = EmitPackedF16Half(GetRawSource(instruction, 1), highLane);
+            var left = EmitPackedF16Half(GetPackedF16Source(instruction, 0), highLane);
+            var right = EmitPackedF16Half(GetPackedF16Source(instruction, 1), highLane);
             var addend = EmitPackedF16Half(accumulator, highLane);
             return EmitFloatToHalf(
                 EmitPackedF16FusedMultiplyAdd(left, right, addend));
         }
+
+        // A source of a packed f16 instruction is a pair of halves. A float inline constant is its f16 value in the low half
+        // and zero in the high half; registers, literals and integer inline constants are their 32-bit value.
+        private uint GetPackedF16Source(Gen5ShaderInstruction instruction, int index) =>
+            instruction.Sources[index] is { Kind: Gen5OperandKind.EncodedConstant, Value: >= 240 and <= 248 } constant
+                ? UInt(constant.Value switch
+                {
+                    240 => 0x3800u,
+                    241 => 0xB800u,
+                    242 => 0x3C00u,
+                    243 => 0xBC00u,
+                    244 => 0x4000u,
+                    245 => 0xC000u,
+                    246 => 0x4400u,
+                    247 => 0xC400u,
+                    _ => 0x3118u,
+                })
+                : GetRawSource(instruction, index);
 
         private uint EmitPackedF16Half(uint raw, bool highLane)
         {
@@ -2387,23 +2405,7 @@ public static partial class Gen5SpirvTranslator
             int index,
             bool highLane)
         {
-            var operand = instruction.Sources[index];
-            if (operand.Kind is Gen5OperandKind.EncodedConstant or Gen5OperandKind.LiteralConstant)
-            {
-                // An inline constant or literal is a single f32 value, not a
-                // packed register: both lanes take the exactly-converted f16 of
-                // the same constant, so there is no half to select.
-                var constant = GetFloatSource(instruction, index);
-                var constantNegate = highLane ? control.NegHiMask : control.NegLoMask;
-                if (((constantNegate >> index) & 1) != 0)
-                {
-                    constant = _module.AddInstruction(SpirvOp.FNegate, _floatType, constant);
-                }
-
-                return constant;
-            }
-
-            var raw = GetRawSource(instruction, index);
+            var raw = GetPackedF16Source(instruction, index);
             var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
             var half = ((selectMask >> index) & 1) != 0
                 ? ShiftRightLogical(raw, UInt(16))
