@@ -129,11 +129,48 @@ public sealed unsafe partial class GuestImageCache
             }
 
             plan.Tiles = tiles;
+        }
+
+        // Guest levels past the host mip chain (CachedImage.MipChainLevels) have no host level to move:
+        // an upload leaves them out, a download leaves their guest bytes as they are.
+        DropLevelsWithoutHostLevel(plan, image.Backing.MipLevels);
+        if (plan.Tiled)
+        {
             plan.LinearSize = LinearSizeOf(plan.Tiles);
         }
 
         plan.Valid = true;
         return plan;
+    }
+
+    // The regions run level by level, so the levels to drop are the last ones. A tile starts at the linear
+    // offset of its first region (a volume tile spans several slices of one level).
+    private static void DropLevelsWithoutHostLevel(ColorTransferPlan plan, uint hostLevels)
+    {
+        var kept = plan.Regions.Count;
+        while (kept > 0 && plan.Regions[kept - 1].ImageSubresource.MipLevel >= hostLevels)
+        {
+            kept--;
+        }
+
+        if (kept == plan.Regions.Count)
+        {
+            return;
+        }
+
+        plan.Regions.RemoveRange(kept, plan.Regions.Count - kept);
+        if (!plan.Tiled)
+        {
+            return;
+        }
+
+        var offsets = new HashSet<ulong>(plan.Regions.Count);
+        foreach (var region in plan.Regions)
+        {
+            offsets.Add(region.BufferOffset);
+        }
+
+        plan.Tiles.RemoveAll(tile => !offsets.Contains(tile.LinearOffset));
     }
 
     private static Exception InvalidAttachmentUpload(in ImageDescription info, CachedImage image) =>

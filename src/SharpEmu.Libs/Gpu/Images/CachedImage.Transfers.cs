@@ -50,7 +50,17 @@ public sealed unsafe partial class CachedImage
             range = range.Value with { BaseLayer = 0, LayerCount = 1 };
         }
 
-        var levels = Description.Resources.Levels;
+        // Barriers name host levels; the guest's levels past the host mip chain map to the last host level.
+        var levels = Backing.MipLevels;
+        var guestLevels = Description.Resources.Levels;
+        if (range is { } requested && levels != 0 && levels < guestLevels && requested.LevelCount != 0 &&
+            requested.BaseLevel < guestLevels && requested.LevelCount <= guestLevels - requested.BaseLevel &&
+            requested.BaseLevel + requested.LevelCount > levels)
+        {
+            range = requested.BaseLevel >= levels
+                ? requested with { BaseLevel = levels - 1, LevelCount = 1 }
+                : requested with { LevelCount = levels - requested.BaseLevel };
+        }
         var layers = Description.Resources.Layers;
         var partial = range is { } window &&
                       (window.BaseLevel != 0 || window.LevelCount != levels || window.BaseLayer != 0 || window.LayerCount != layers);
