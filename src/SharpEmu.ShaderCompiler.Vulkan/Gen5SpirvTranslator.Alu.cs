@@ -5273,9 +5273,14 @@ public static partial class Gen5SpirvTranslator
 
             left = BitwiseAnd(left, UInt(0xFFFF));
             right = BitwiseAnd(right, UInt(0xFFFF));
-            var low16 = BitwiseAnd(
-                _module.AddInstruction(operation, _uintType, left, right),
-                UInt(0xFFFF));
+            var value = _module.AddInstruction(operation, _uintType, left, right);
+            if (control?.Clamp == true && operation == SpirvOp.IAdd)
+            {
+                // The clamp bit saturates V_ADD_NC_U16 in the unsigned 16-bit domain.
+                value = Ext(38, _uintType, value, UInt(0xFFFF));
+            }
+
+            var low16 = BitwiseAnd(value, UInt(0xFFFF));
             var current = LoadV(destination);
 
             return (control?.OperandSelect & 0x8) != 0

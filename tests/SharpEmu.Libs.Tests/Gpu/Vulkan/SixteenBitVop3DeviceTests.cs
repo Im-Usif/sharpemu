@@ -34,6 +34,13 @@ public sealed class SixteenBitVop3DeviceTests(HeadlessVulkanFixture fixture) : I
             new Case("high halves", "VMadU32U16", new Gen5Vop3Control(0, 0, 0, false, 0b011, null), 0x0003_0005u, 0x0007_0002u, 100u, 121u),
             new Case("low halves", "VMadU32U16", new Gen5Vop3Control(0, 0, 0, false, 0, null), 0x0003_0005u, 0x0007_0002u, 100u, 110u));
 
+    // The clamp bit saturates V_ADD_NC_U16 in the unsigned 16-bit domain; the high half stays.
+    [Fact]
+    public void AddNcU16SaturatesWithTheClampBit() =>
+        Check(
+            new Case("clamp", "VAddNcU16", new Gen5Vop3Control(0, 0, 0, true, 0, null), 0xFFF0u, 0x0020u, 0u, 0xDEAD_FFFFu),
+            new Case("no clamp", "VAddNcU16", new Gen5Vop3Control(0, 0, 0, false, 0, null), 0xFFF0u, 0x0020u, 0u, 0xDEAD_0010u));
+
     private void Check(params Case[] cases)
     {
         var vulkan = fixture.Vulkan;
