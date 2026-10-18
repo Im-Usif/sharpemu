@@ -269,6 +269,44 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A raw binding over a whole GPU-modified image leaves the image its GPU ownership (it may be a window that
+    // never writes there), but the shader can write the image's bytes. A later typed write over part of the
+    // image must not publish the image's older contents over the bytes the raw binding wrote.
+    [Fact]
+    public void RawWindowWriteOverGpuImage_SurvivesALaterPartialWrite()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var image = Color32(address, 8192);
+        var imageId = harness.Acquire(ref image);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111)));
+        Assert.True(harness.Image(imageId).IsGpuModified);
+
+        harness.Worker.Run(() =>
+        {
+            harness.Images.PublishImagesUnderRawWrite(address, 0x10000);
+            var (bound, offset) = harness.Cache.ObtainBuffer(address, 0x10000, isWritten: true);
+            harness.Images.InvalidateMemoryCopiesFromGpu(address, 0x10000);
+            bound.Fill(offset + 0x5000, 0x100, 0x33333333);
+        });
+        Assert.True(harness.Image(imageId).IsGpuModified);
+
+        var writeAddress = address + 0x3000;
+        harness.Worker.Run(() =>
+        {
+            harness.Images.InvalidateMemoryFromGpu(writeAddress, 4);
+            var (bound, offset) = harness.Cache.ObtainBuffer(writeAddress, 4, isWritten: true, isTexelBuffer: true);
+            bound.Fill(offset, 4, 0x55667788);
+        });
+
+        Assert.True(harness.Cache.DownloadToCpu(address, 0x10000));
+        Assert.Equal(0x55667788u, harness.ReadUInt32(writeAddress));
+        Assert.Equal(0x33333333u, harness.ReadUInt32(address + 0x5000));
+        Assert.Equal(0x33333333u, harness.ReadUInt32(address + 0x50FC));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void FullColorClear_SkipsSourceBufferAndRetainsWriteObservation()
     {

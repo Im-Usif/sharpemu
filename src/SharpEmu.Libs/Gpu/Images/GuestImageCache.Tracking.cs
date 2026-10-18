@@ -515,7 +515,9 @@ public sealed partial class GuestImageCache
     // contents move into the buffer over its range first, so its next upload, or another image over those
     // bytes, starts from them instead of stale guest memory. Buffer bytes the GPU wrote under the image
     // before it are older than its contents: a buffer write after it over part of it published it then.
-    // The buffer is obtained outside the lock; contents that cannot be copied are lost as before.
+    // A raw binding over the whole image leaves it GPU-modified; its bytes may be newer than the image,
+    // so such an image is not published. The buffer is obtained outside the lock; contents that cannot
+    // be copied are lost as before.
     private void PublishPartlyWrittenImages(ulong address, ulong size)
     {
         List<ResourceSlotIdentifier>? partlyWritten = null;
@@ -526,7 +528,8 @@ public sealed partial class GuestImageCache
                 var image = _slots[imageIdentifier];
                 var range = image.Description.Data;
                 if (image.IsGpuModified && !image.DepthOwner.IsValid && image.Overlaps(address, size) &&
-                    (address > range.Address || address + size < range.Address + range.Size) && image.SafeToDownload)
+                    (address > range.Address || address + size < range.Address + range.Size) &&
+                    image.SafeToDownload && !image.RawWriteAfterGpuWrite)
                 {
                     (partlyWritten ??= []).Add(imageIdentifier);
                 }
@@ -590,8 +593,14 @@ public sealed partial class GuestImageCache
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true))
         {
             var image = _slots[imageIdentifier];
-            if (image.DepthOwner.IsValid || image.IsGpuModified || !image.Overlaps(address, size))
+            if (image.DepthOwner.IsValid || !image.Overlaps(address, size))
             {
+                continue;
+            }
+
+            if (image.IsGpuModified)
+            {
+                image.MarkRawWriteAfterGpuWrite();
                 continue;
             }
 

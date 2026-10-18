@@ -424,8 +424,15 @@ public sealed unsafe partial class CachedImage : IDisposable
     // The write sequence of the mip tail block image last copied into this chain's tail mips.
     public long MergedTailSequence;
 
+    // A raw buffer binding over the image may have written its bytes after the GPU last wrote the image.
+    // The image keeps its contents, but they are no longer known to be newer than the buffer's.
+    public bool RawWriteAfterGpuWrite { get; private set; }
+
+    public void MarkRawWriteAfterGpuWrite() => RawWriteAfterGpuWrite = true;
+
     public void MarkGpuModified()
     {
+        RawWriteAfterGpuWrite = false;
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
         GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
