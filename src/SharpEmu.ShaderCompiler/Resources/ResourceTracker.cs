@@ -1510,6 +1510,7 @@ public sealed partial class ResourceTracker
             {
                 SelectorValues = IndirectSelectorValues.Create(_plan, selector),
                 MaterialImmediate = materialMemory.Offset,
+                SharedSelector = selector.Kind != ScalarValueKind.FirstLane,
             },
         };
 

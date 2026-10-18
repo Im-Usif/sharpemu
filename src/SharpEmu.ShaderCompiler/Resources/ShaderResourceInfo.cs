@@ -219,6 +219,10 @@ public sealed record IndirectImageSelector(
     public uint KeyBound { get; init; }
     public WaveIndexedImageSelector? WaveIndexed { get; init; }
 
+    // The key is selected by a value the whole wave shares (a loop counter), not by a lane's value. Such an image
+    // used to read as a null image, so a table the host cannot read stays null instead of failing the program.
+    public bool SharedSelector { get; init; }
+
     // The key read's immediate offset. The hardware adds it after the 32-bit selector offset, without wrapping.
     public uint MaterialImmediate { get; init; }
 }
