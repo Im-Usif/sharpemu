@@ -367,4 +367,288 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
             Assert.Equal(lane >= 28 ? 12u : 11u, lanes[lane]);
         }
     }
+
+    // A minimum folded through the LDS, the way a 64-lane group reduces a value to one: every lane writes its value, then the
+    // lower half of the remaining lanes takes the minimum of its own slot and the slot half a span away, until lane 0 holds
+    // the minimum of the whole wave. The first fold reads what the other half of the wave wrote.
+    [Theory]
+    [InlineData(45u, 8u)]
+    [InlineData(33u, 8u)]
+    [InlineData(7u, 8u)]
+    [InlineData(20u, 8u)]
+    [InlineData(45u, 64u)]
+    [InlineData(33u, 64u)]
+    [InlineData(7u, 64u)]
+    public void AMinimumFoldedThroughSharedMemory_SeesEveryLane(uint smallestLane, uint threadsX)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAddU32", 3, Operand(64 - smallestLane), Gen5Operand.Vector(2)));
+        Add(Vop2(0, "VAndB32", 3, Operand(63), Gen5Operand.Vector(3)));
+        Add(Vop2(0, "VAddU32", 3, Operand(5), Gen5Operand.Vector(3)));
+        Add(Vop1(0, "VCvtF32U32", 10, Gen5Operand.Vector(3)));
+        Add(Vop2(0, "VLshlrevB32", 6, Operand(2), Gen5Operand.Vector(2)));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(10)], []));
+        foreach (var half in new uint[] { 32, 16, 8, 4, 2 })
+        {
+            // The guest writes the three widest masks with S_BFM_B64 and the others as literals.
+            Add(half >= 8
+                ? Sop2(0, "SBfmB64", Exec, Operand(half), Operand(0))
+                : Sop1(0, "SMovB64", Exec, Operand((1u << (int)half) - 1)));
+            Add(DataShare(0, "DsRead2B32", false, [Gen5Operand.Vector(6)], [11, 12], 0, half));
+            Add(Vop2(0, "VMinF32", 11, Gen5Operand.Vector(11), Gen5Operand.Vector(12)));
+            Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(11)], []));
+        }
+
+        Add(Sop1(0, "SMovB64", Exec, Operand(1)));
+        Add(DataShare(0, "DsReadB64", false, [Gen5Operand.Vector(6)], [11, 12]));
+        Add(Vop2(0, "VMinF32", 11, Gen5Operand.Vector(11), Gen5Operand.Vector(12)));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(11)], []));
+        Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Add(MoveVector(0, 7, 0));
+        Add(DataShare(0, "DsReadB32", false, [Gen5Operand.Vector(7)], [13]));
+        Add(Vop1(0, "VCvtU32F32", 4, Gen5Operand.Vector(13)));
+
+        Assert.All(Run(64, threadsX, 64 / threadsX), value => Assert.Equal(5u, value));
+    }
+
+    // The shape of a 64-lane group that reduces a list to one value: an outer loop hands every lane one item per pass, two
+    // tests narrow EXEC and save it, an inner loop runs each lane its own count under a counter the wave shares and drops a
+    // lane early, the saved masks come back in turn, and the per-lane minimum is folded through the LDS at the end.
+    [Theory]
+    [InlineData(150u, 8u)]
+    [InlineData(150u, 64u)]
+    [InlineData(40u, 64u)]
+    [InlineData(64u, 64u)]
+    [InlineData(97u, 64u)]
+    public void ANestedLoopReduction_SeesEveryItemOfEveryLane(uint items, uint threadsX)
+    {
+        if (!Ready()) return;
+        const uint big = 100000;
+        Lane();
+        Add(Vop2(0, "VAddU32", 24, Operand(0), Gen5Operand.Vector(2)));
+        Add(MoveVector(0, 21, big));
+        Add(MoveScalar(0, 56, items));
+        Add(Sop1(0, "SMovB64", 58, Gen5Operand.Scalar(Exec)));
+        var top = Add(Vopc(0, "VCmpxGtU32", Gen5Operand.Scalar(56), 24));
+        var exitOuter = Add(Branch(0, "SCbranchExecz", 0));
+        Add(Sop1(0, "SMovB64", 34, Gen5Operand.Scalar(Exec)));
+        Add(Vop2(0, "VAndB32", 3, Operand(4), Gen5Operand.Vector(24)));
+        Add(Vopc(0, "VCmpxEqU32", Operand(0), 3));
+        var skipFirst = Add(Branch(0, "SCbranchExecz", 0));
+        Add(Sop1(0, "SMovB64", 38, Gen5Operand.Scalar(Exec)));
+        Add(MoveVector(0, 8, big));
+        Add(Vop2(0, "VAndB32", 3, Operand(8), Gen5Operand.Vector(24)));
+        Add(Vopc(0, "VCmpxEqU32", Operand(0), 3));
+        var skipSecond = Add(Branch(0, "SCbranchExecz", 0));
+        Add(MoveScalar(0, 57, 0));
+        Add(Sop1(0, "SMovB64", 52, Gen5Operand.Scalar(Exec)));
+        Add(MoveVector(0, 5, 0));
+        Add(Vop2(0, "VAndB32", 30, Operand(3), Gen5Operand.Vector(24)));
+        var inner = Add(Vopc(0, "VCmpxLtU32", Gen5Operand.Scalar(57), 30));
+        var exitInner = Add(Branch(0, "SCbranchExecz", 0));
+        Add(Sop1(0, "SMovB64", 54, Gen5Operand.Scalar(Exec)));
+        Add(Vop2(0, "VAddU32", 5, Operand(1), Gen5Operand.Vector(5)));
+        Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(54)));
+        Add(Sop2(0, "SAddI32", 57, Gen5Operand.Scalar(57), Operand(1)));
+        Add(Vopc(0, "VCmpLeU32", Operand(2), 5));
+        Add(Sop2(0, "SAndn2B64", Exec, Gen5Operand.Scalar(54), Gen5Operand.Scalar(Vcc)));
+        var again = Add(Branch(0, "SCbranchExecnz", 0));
+        var afterInner = Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(52)));
+        Add(Vop2(0, "VXorB32", 9, Operand(42), Gen5Operand.Vector(24)));
+        Add(Vop2(0, "VAndB32", 9, Operand(63), Gen5Operand.Vector(9)));
+        Add(Vop2(0, "VLshlrevB32", 9, Operand(2), Gen5Operand.Vector(9)));
+        Add(Vop2(0, "VAddU32", 8, Gen5Operand.Vector(5), Gen5Operand.Vector(9)));
+        var afterSecond = Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(38)));
+        Add(Vop2(0, "VMinU32", 21, Gen5Operand.Vector(21), Gen5Operand.Vector(8)));
+        var afterFirst = Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(34)));
+        Add(Vop2(0, "VAddU32", 24, Operand(64), Gen5Operand.Vector(24)));
+        var loop = Add(Branch(0, "SBranch", 0));
+        var done = Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(58)));
+        Point(exitOuter, done);
+        Point(skipFirst, afterFirst);
+        Point(skipSecond, afterSecond);
+        Point(exitInner, afterInner);
+        Point(again, inner);
+        Point(loop, top);
+
+        Add(Vop2(0, "VLshlrevB32", 6, Operand(2), Gen5Operand.Vector(2)));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(21)], []));
+        foreach (var half in new uint[] { 32, 16, 8, 4, 2 })
+        {
+            Add(half >= 8
+                ? Sop2(0, "SBfmB64", Exec, Operand(half), Operand(0))
+                : Sop1(0, "SMovB64", Exec, Operand((1u << (int)half) - 1)));
+            Add(DataShare(0, "DsRead2B32", false, [Gen5Operand.Vector(6)], [11, 12], 0, half));
+            Add(Vop2(0, "VMinU32", 11, Gen5Operand.Vector(11), Gen5Operand.Vector(12)));
+            Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(11)], []));
+        }
+
+        Add(Sop1(0, "SMovB64", Exec, Operand(1)));
+        Add(DataShare(0, "DsReadB64", false, [Gen5Operand.Vector(6)], [11, 12]));
+        Add(Vop2(0, "VMinU32", 11, Gen5Operand.Vector(11), Gen5Operand.Vector(12)));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(11)], []));
+        Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Add(MoveVector(0, 7, 0));
+        Add(DataShare(0, "DsReadB32", false, [Gen5Operand.Vector(7)], [4]));
+
+        var expected = big;
+        for (uint item = 0; item < items; item++)
+        {
+            if ((item & 4) != 0 || (item & 8) != 0) continue;
+            expected = Math.Min(expected, (((item ^ 42) & 63) << 2) + Math.Min(item & 3, 2u));
+        }
+
+        Assert.All(Run(64, threadsX, 64 / threadsX), value => Assert.Equal(expected, value));
+    }
+
+    // The shape of a 256-thread group that counts the items passing a test: thread 0 clears a count in the LDS, every
+    // thread takes one item per pass and the passing ones add one to the count under a saved EXEC, and after a group
+    // barrier every thread reads the count. The passing items sit in different waves and passes.
+    [Theory]
+    [InlineData(300u, 0x1FFu, 290u)]
+    [InlineData(300u, 0x1FFu, 70u)]
+    [InlineData(200u, 0xFFu, 199u)]
+    [InlineData(600u, 0x3Fu, 5u)]
+    [InlineData(1000u, 0x7Fu, 100u)]
+    public void ACountThroughSharedMemoryInAGroupOfFourWaves_SeesEveryThread(uint items, uint mask, uint value)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(MoveVector(0, 7, 0));
+        Add(MoveVector(0, 9, 1));
+        CompareTo("VCmpEqU32", 40, Operand(0), Gen5Operand.Vector(2));
+        Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(40)));
+        var noClear = Add(Branch(0, "SCbranchExecz", 0));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(7), Gen5Operand.Vector(7)], []));
+        var afterClear = Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Point(noClear, afterClear);
+        Add(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Sopp, "SBarrier", [0], [], [], null));
+        Add(Vop2(0, "VAddU32", 13, Operand(0), Gen5Operand.Vector(2)));
+        Add(MoveScalar(0, 15, items));
+        var top = Add(Vopc(0, "VCmpxGtU32", Gen5Operand.Scalar(15), 13));
+        var exit = Add(Branch(0, "SCbranchExecz", 0));
+        Add(Sop1(0, "SMovB64", Vcc, Gen5Operand.Scalar(Exec)));
+        Add(Vop2(0, "VAndB32", 3, Operand(mask), Gen5Operand.Vector(13)));
+        Add(Vopc(0, "VCmpxEqU32", Operand(value), 3));
+        var skipAdd = Add(Branch(0, "SCbranchExecz", 0));
+        Add(DataShare(0, "DsAddU32", false, [Gen5Operand.Vector(7), Gen5Operand.Vector(9)], []));
+        var restore = Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(Vcc)));
+        Add(Vop2(0, "VAddU32", 13, Operand(256), Gen5Operand.Vector(13)));
+        var loop = Add(Branch(0, "SBranch", 0));
+        var done = Add(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Sopp, "SBarrier", [0], [], [], null));
+        Point(exit, done);
+        Point(skipAdd, restore);
+        Point(loop, top);
+        Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Add(DataShare(0, "DsReadB32", false, [Gen5Operand.Vector(7)], [4]));
+
+        var expected = 0u;
+        for (uint item = 0; item < items; item++)
+        {
+            if ((item & mask) == value) expected++;
+        }
+
+        Assert.All(Run(64, 256, 1), count => Assert.Equal(expected, count));
+    }
+
+    // A group of four waves: each wave's masks, counts and lane reads cover the 64 lanes of that wave and no other.
+    private uint[] RunGroupOfFourWaves(uint localDataShareDwords = 0) => Run(localDataShareDwords, 256, 1);
+
+    [Fact]
+    public void AWaveOfAGroupOfFourWaves_CountsACompareOverBothHalves()
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAndB32", 3, Operand(63), Gen5Operand.Vector(2)));
+        CompareTo("VCmpLtU32", 10, Gen5Operand.Vector(3), Operand(40));
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(10)));
+        Add(MoveVectorFromScalar(0, 4, 14));
+
+        Assert.All(RunGroupOfFourWaves(), value => Assert.Equal(40u, value));
+    }
+
+    [Theory]
+    [InlineData(40u)]
+    [InlineData(3u)]
+    public void ReadFirstLane_InAGroupOfFourWaves_TakesTheFirstActiveLaneOfItsWave(uint firstActiveLane)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAndB32", 3, Operand(63), Gen5Operand.Vector(2)));
+        Add(Vop2(0, "VAddU32", 5, Operand(100), Gen5Operand.Vector(2)));
+        Add(Vopc(0, "VCmpxLeU32", Operand(firstActiveLane), 3));
+        Add(ReadFirstLane(0, 20, 5));
+        Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Add(MoveVectorFromScalar(0, 4, 20));
+
+        var lanes = RunGroupOfFourWaves();
+        for (uint thread = 0; thread < 256; thread++)
+        {
+            Assert.Equal(100 + (thread & ~63u) + firstActiveLane, lanes[thread]);
+        }
+    }
+
+    [Theory]
+    [InlineData(40u)]
+    [InlineData(7u)]
+    public void ReadLane_InAGroupOfFourWaves_ReadsTheLaneInEitherHalf(uint lane)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAddU32", 5, Operand(100), Gen5Operand.Vector(2)));
+        Add(ReadLane(0, 20, 5, lane));
+        Add(MoveVectorFromScalar(0, 4, 20));
+
+        var lanes = RunGroupOfFourWaves();
+        for (uint thread = 0; thread < 256; thread++)
+        {
+            Assert.Equal(100 + (thread & ~63u) + lane, lanes[thread]);
+        }
+    }
+
+    [Fact]
+    public void Mbcnt_InAGroupOfFourWaves_CountsTheLanesBelowAcrossTheHalves()
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop3(0, "VMbcntLoU32B32", 4, Gen5Operand.Scalar(Exec), Operand(0)));
+        Add(Vop3(0, "VMbcntHiU32B32", 4, Gen5Operand.Scalar(Exec + 1), Gen5Operand.Vector(4)));
+
+        var lanes = RunGroupOfFourWaves();
+        for (uint thread = 0; thread < 256; thread++)
+        {
+            Assert.Equal(thread & 63, lanes[thread]);
+        }
+    }
+
+    // Each wave's first lane stores the wave's count in the wave's LDS slot, and every thread adds the four slots: the
+    // way a group sums what its waves found. A wave that counts each half alone leaves out the lanes of the other half.
+    [Theory]
+    [InlineData(40u)]
+    [InlineData(64u)]
+    [InlineData(20u)]
+    public void AWaveCountInSharedMemory_InAGroupOfFourWaves_HoldsTheWholeWave(uint passing)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAndB32", 3, Operand(63), Gen5Operand.Vector(2)));
+        Add(Vop2(0, "VLshrrevB32", 6, Operand(6), Gen5Operand.Vector(2)));
+        Add(Vop2(0, "VLshlrevB32", 6, Operand(2), Gen5Operand.Vector(6)));
+        CompareTo("VCmpLtU32", 10, Gen5Operand.Vector(3), Operand(passing));
+        Add(Sop1(0, "SBcnt1I32B64", 14, Gen5Operand.Scalar(10)));
+        Add(MoveVectorFromScalar(0, 7, 14));
+        Add(Vopc(0, "VCmpxEqU32", Operand(0), 3));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(6), Gen5Operand.Vector(7)], []));
+        Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Add(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Sopp, "SBarrier", [0], [], [], null));
+        Add(MoveVector(0, 8, 0));
+        Add(DataShare(0, "DsRead2B32", false, [Gen5Operand.Vector(8)], [11, 12], 0, 1));
+        Add(DataShare(0, "DsRead2B32", false, [Gen5Operand.Vector(8)], [13, 14], 2, 3));
+        Add(Vop2(0, "VAddU32", 4, Gen5Operand.Vector(11), Gen5Operand.Vector(12)));
+        Add(Vop2(0, "VAddU32", 4, Gen5Operand.Vector(13), Gen5Operand.Vector(4)));
+        Add(Vop2(0, "VAddU32", 4, Gen5Operand.Vector(14), Gen5Operand.Vector(4)));
+
+        Assert.All(RunGroupOfFourWaves(64), value => Assert.Equal(4 * passing, value));
+    }
 }
