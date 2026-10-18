@@ -150,6 +150,29 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A DCC fill seen before its target leaves a pending registration, and a write over the fill's range leaves
+    // it unknown. A depth target that takes the address as its HTile drops the pending DCC state either way, so
+    // it starts as at an address nothing registered.
+    [Fact]
+    public void DepthTarget_StartsAsNewOverAPendingDccFillAWriteLeftUnknown()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var metadataAddress = address + 0x10000;
+        Assert.False(harness.Images.TryAbsorbDccFill(metadataAddress, 0x100, 0));
+        Assert.False(harness.ImageStore.MarkCpuWrite(metadataAddress, 8));
+
+        var depth = AsDepthTarget(LinearRequest(address + 0x8000, 4, Format.D32Sfloat,
+            GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1), Format.D32Sfloat);
+        depth.Description.Metadata.Kind = MetadataKind.Htile;
+        depth.Description.Metadata.Range = new GuestSpan(metadataAddress, 0x100);
+        harness.Acquire(ref depth);
+
+        Assert.True(harness.Images.IsMetadataCleared(metadataAddress, 0));
+        harness.Shutdown();
+    }
+
     // A color target whose DCC lands where a depth target kept its HTile takes the address the same way.
     [Fact]
     public void ColorTarget_ReplacesTheHtileOfAnotherSurfaceAtItsDccAddress()
