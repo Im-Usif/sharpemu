@@ -3201,6 +3201,25 @@ public static partial class Gen5SpirvTranslator
             return observed;
         }
 
+        // A buffer atomic outside its range is dropped; with glc its data registers read zero, as an
+        // out-of-range load does, instead of keeping the operand.
+        private void EmitBufferAtomicInRange(uint inRange, bool glc, uint dataRegister, uint dataDwords, Action atomic)
+        {
+            if (!glc)
+            {
+                EmitConditional(inRange, atomic);
+                return;
+            }
+
+            EmitConditional(inRange, atomic, () =>
+            {
+                for (uint index = 0; index < dataDwords; index++)
+                {
+                    StoreV(dataRegister + index, UInt(0));
+                }
+            });
+        }
+
         // Maps the AMD atomic-op name suffix shared by buffer/image atomics to a SPIR-V opcode.
         // Inc/Dec approximate the AMD wrap-clamp semantics (MEM = tmp >= DATA ? 0 : tmp + 1),
         // which is exact for the common 0xFFFFFFFF clamp operand.
@@ -3555,7 +3574,7 @@ public static partial class Gen5SpirvTranslator
                     var firstInRange = IsBufferWordInRange(bindingIndex, dwordAddress);
                     var secondAddress = IAdd(dwordAddress, UInt(1));
                     var secondInRange = IsBufferWordInRange(bindingIndex, secondAddress);
-                    EmitConditional(LogicalAnd(firstInRange, secondInRange), () =>
+                    EmitBufferAtomicInRange(LogicalAnd(firstInRange, secondInRange), control.Glc, control.VectorData, 2, () =>
                     {
                         var atomicOp = instruction.Opcode == "BufferAtomicSwapX2"
                             ? SpirvOp.AtomicExchange
@@ -3595,7 +3614,7 @@ public static partial class Gen5SpirvTranslator
                     EmitExecConditional(() =>
                     {
                         var inRange = IsBufferWordInRange(bindingIndex, dwordAddress);
-                        EmitConditional(inRange, () =>
+                        EmitBufferAtomicInRange(inRange, control.Glc, control.VectorData, 1, () =>
                         {
                             var original = EmitBufferFloatAtomic(
                                 BufferWordPointer(bindingIndex, dwordAddress),
@@ -3622,7 +3641,7 @@ public static partial class Gen5SpirvTranslator
                 EmitExecConditional(() =>
                 {
                     var inRange = IsBufferWordInRange(bindingIndex, dwordAddress);
-                    EmitConditional(inRange, () =>
+                    EmitBufferAtomicInRange(inRange, control.Glc, control.VectorData, 1, () =>
                     {
                         var original = EmitAtomic(
                             atomicOp,
@@ -4017,12 +4036,12 @@ public static partial class Gen5SpirvTranslator
                     var valid = IsDeviceBufferByteRangeInRange(size, byteAddress, 2 * sizeof(uint));
                     var firstAddress = And64(IAdd64(baseAddress, Widen(byteAddress)), ULong(DeviceAddressMask & ~3ul));
                     var secondAddress = And64(IAdd64(baseAddress, Widen(IAdd(byteAddress, UInt(sizeof(uint))))), ULong(DeviceAddressMask & ~3ul));
-                    EmitConditional(valid, () =>
+                    EmitBufferAtomicInRange(valid, control.Glc, control.VectorData, 2, () =>
                     {
                         var (firstPointer, firstMapped) = ResolveDeviceAddress(firstAddress);
                         var (secondPointer, secondMapped) = ResolveDeviceAddress(secondAddress);
                         var bothMapped = LogicalAnd(firstMapped, secondMapped);
-                        EmitConditional(bothMapped, () =>
+                        EmitBufferAtomicInRange(bothMapped, control.Glc, control.VectorData, 2, () =>
                         {
                             var originalLow = EmitAtomic(
                                 atomicOp, _uintType, DeviceWordPointer(firstPointer), 1, 0x48,
@@ -4047,10 +4066,10 @@ public static partial class Gen5SpirvTranslator
                 {
                     var valid = IsDeviceBufferByteRangeInRange(size, byteAddress, sizeof(uint));
                     var address = And64(IAdd64(baseAddress, Widen(byteAddress)), ULong(DeviceAddressMask & ~3ul));
-                    EmitConditional(valid, () =>
+                    EmitBufferAtomicInRange(valid, control.Glc, control.VectorData, 1, () =>
                     {
                         var (pointer, mapped) = ResolveDeviceAddress(address);
-                        EmitConditional(mapped, () =>
+                        EmitBufferAtomicInRange(mapped, control.Glc, control.VectorData, 1, () =>
                         {
                             var original = EmitBufferFloatAtomic(
                                 DeviceWordPointer(pointer),
@@ -4076,10 +4095,10 @@ public static partial class Gen5SpirvTranslator
             {
                 var valid = IsDeviceBufferByteRangeInRange(size, byteAddress, sizeof(uint));
                 var address = And64(IAdd64(baseAddress, Widen(byteAddress)), ULong(DeviceAddressMask & ~3ul));
-                EmitConditional(valid, () =>
+                EmitBufferAtomicInRange(valid, control.Glc, control.VectorData, 1, () =>
                 {
                     var (pointer, mapped) = ResolveDeviceAddress(address);
-                    EmitConditional(mapped, () =>
+                    EmitBufferAtomicInRange(mapped, control.Glc, control.VectorData, 1, () =>
                     {
                         var original = EmitAtomic(
                             atomicOperation,
