@@ -75,7 +75,14 @@ internal sealed record ShaderCallLibrary(string Identity, IReadOnlyList<ShaderCa
             var address = descriptor[0] | ((ulong)(descriptor[1] & 0xFFFF) << 32);
             var stride = (descriptor[1] >> 16) & 0x3FFF;
             var size = (ulong)descriptor[2] * Math.Max(stride, 1u);
-            if (size == 0 || size > MaxTableBytes || (size & 15) != 0 || (descriptor[1] & 0x80000000) != 0)
+            var returnAddress = unchecked(caller.Address + call.ProgramOffset + (ulong)call.Words.Count * sizeof(uint));
+            if (size == 0)
+            {
+                // A buffer without records reads zero for every load: a null target, so the call has no target.
+                calls.Add(new(call.Pc, call.Sources[0].Value, argumentRegister, call.Destinations[0].Value, returnAddress, []));
+                continue;
+            }
+            if (size > MaxTableBytes || (size & 15) != 0 || (descriptor[1] & 0x80000000) != 0)
                 throw new InvalidOperationException(
                     $"The shader call table extent or layout is not supported: address=0x{address:X} stride={stride} records={descriptor[2]} " +
                     $"swizzle={descriptor[1] >> 31} dynamic={loadControl.DynamicOffsetRegister.HasValue} offset={loadControl.ImmediateOffsetBytes}.");
@@ -103,8 +110,7 @@ internal sealed record ShaderCallLibrary(string Identity, IReadOnlyList<ShaderCa
                 }
                 targets.Add(new(target, argument, function));
             }
-            calls.Add(new(call.Pc, call.Sources[0].Value, argumentRegister, call.Destinations[0].Value,
-                unchecked(caller.Address + call.ProgramOffset + (ulong)call.Words.Count * sizeof(uint)), targets));
+            calls.Add(new(call.Pc, call.Sources[0].Value, argumentRegister, call.Destinations[0].Value, returnAddress, targets));
         }
         identity.AppendData(BitConverter.GetBytes(caller.Address));
         return new(Convert.ToHexString(identity.GetHashAndReset()), calls);
