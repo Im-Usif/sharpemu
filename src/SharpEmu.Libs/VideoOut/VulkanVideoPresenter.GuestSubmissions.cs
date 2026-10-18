@@ -40,6 +40,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Translated draws are recorded into the scheduler's current buffer and
         // submitted once per drained work batch (one vkQueueSubmit per batch).
         private bool _batchOpen;
+        private long _batchOpenedTicks;
         private int _batchDrawCount;
         private readonly List<SubmissionUploadResources> _batchResources = new();
 
@@ -71,6 +72,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!_batchOpen)
             {
                 _batchOpen = true;
+                _batchOpenedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 _batchDrawCount = 0;
             }
         }
