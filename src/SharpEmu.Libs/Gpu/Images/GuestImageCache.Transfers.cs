@@ -843,6 +843,7 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.EndRendering();
         VulkanSynchronization.PipelineBarrier(_device.Vk,new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
         var backing = _backing;
+        var landingDecided = LandingDecidedForTest;
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             download.Invalidate(offset, range.Size);
@@ -850,7 +851,7 @@ public sealed unsafe partial class GuestImageCache
             var published = download.Mapped.Slice((int)offset, (int)range.Size);
             // A range that lost resident pages since it was queued cannot be compared page by page; its resident pages
             // take the readback whole, as before the landing.
-            if (!landing.TryLand(backing, published) &&
+            if (!landing.TryLand(backing, published, landingDecided) &&
                 !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
             {
                 throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");

@@ -710,4 +710,44 @@ public sealed partial class GuestImageCacheTests
         Assert.Equal(0u, harness.ReadUInt32(store));
         harness.Shutdown();
     }
+
+    // A store reported while a readback is landing waits for the landing and lands after it, as it would after
+    // the GPU's own write. It waits before it takes the image lock, so the cache stays usable meanwhile.
+    [Fact]
+    public async Task CpuWriteWhileReadbackLands_LandsAfterTheReadback()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var request = Color32(address, 8192);
+        var imageIdentifier = harness.Acquire(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111u)));
+
+        var store = address + 0x5000;
+        Task? storing = null;
+        var storedWhileLanding = true;
+        var cacheUsableWhileWaiting = false;
+        harness.Images.LandingDecidedForTest = () =>
+        {
+            storing = Task.Run(() =>
+            {
+                harness.Gpu.MarkCpuWrite(store, 8);
+                harness.Write(store, Bytes(0x44444444u, 0x45454545u));
+            });
+            storedWhileLanding = storing.Wait(200);
+            cacheUsableWhileWaiting = Task.Run(() => harness.ImagesInRange(address, 0x8000)).Wait(5000);
+        };
+        Assert.True(harness.Worker.Run(() => harness.Images.TryDownloadForTest(imageIdentifier)));
+        harness.Images.LandingDecidedForTest = null;
+        harness.Finish();
+
+        Assert.NotNull(storing);
+        await storing!.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address));
+        Assert.Equal(0x44444444u, harness.ReadUInt32(store));
+        Assert.Equal(0x45454545u, harness.ReadUInt32(store + 4));
+        Assert.False(storedWhileLanding);
+        Assert.True(cacheUsableWhileWaiting);
+        harness.Shutdown();
+    }
 }

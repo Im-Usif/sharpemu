@@ -40,7 +40,8 @@ internal sealed class ReadbackLandings
     }
 
     // A guest store reported before it lands: the readbacks still to land over it keep the pages it
-    // covers. Write faults report stores, so this walks the queue as it stands and allocates nothing.
+    // covers, and one landing over it now finishes first. Write faults report stores, so this walks the
+    // queue as it stands and allocates nothing; callers report outside the image lock.
     public void NoteGuestStore(ulong address, ulong size)
     {
         foreach (var landing in Pending)
@@ -67,6 +68,8 @@ internal sealed class ReadbackLanding
     private readonly int _size;
     private readonly ulong[] _pageHashes;
     private readonly long[] _storedPages;
+    private readonly object _gate = new();
+    private bool _landed;
 
     internal ReadbackLanding(ReadbackLandings queue, ulong address, ReadOnlySpan<byte> snapshot)
     {
@@ -81,7 +84,8 @@ internal sealed class ReadbackLanding
         }
     }
 
-    // Marks the pages of the readback that a reported guest store covers.
+    // Marks the pages of the readback that a reported guest store covers. A landing under way holds the
+    // readback, so the store waits for it and then lands after its bytes, as after the GPU's own write.
     public void NoteGuestStore(ulong address, ulong size)
     {
         var end = _address + (ulong)_size;
@@ -90,17 +94,25 @@ internal sealed class ReadbackLanding
             return;
         }
 
-        var first = (int)((Math.Max(address, _address) - _address) / PageBytes);
-        var last = (int)((Math.Min(address + size, end) - 1 - _address) / PageBytes);
-        for (var page = first; page <= last; page++)
+        lock (_gate)
         {
-            Interlocked.Or(ref _storedPages[page / 64], 1L << (page % 64));
+            if (_landed)
+            {
+                return;
+            }
+
+            var first = (int)((Math.Max(address, _address) - _address) / PageBytes);
+            var last = (int)((Math.Min(address + size, end) - 1 - _address) / PageBytes);
+            for (var page = first; page <= last; page++)
+            {
+                Interlocked.Or(ref _storedPages[page / 64], 1L << (page % 64));
+            }
         }
     }
 
-    // Writes the readback over every page the guest has not stored to since it was queued.
-    // Landings run one at a time.
-    public bool TryLand(IGuestBackedSpace backing, ReadOnlySpan<byte> readback)
+    // Writes the readback over every page the guest has not stored to since it was queued. Landings run
+    // one at a time, and each holds its readback while it decides and writes.
+    public bool TryLand(IGuestBackedSpace backing, ReadOnlySpan<byte> readback, Action? decided = null)
     {
         var kept = 0;
         var window = ArrayPool<byte>.Shared.Rent(Math.Min(readback.Length, WindowBytes));
@@ -108,6 +120,7 @@ internal sealed class ReadbackLanding
         try
         {
             lock (_queue)
+            lock (_gate)
             {
                 for (var windowStart = 0; windowStart < readback.Length; windowStart += WindowBytes)
                 {
@@ -124,6 +137,9 @@ internal sealed class ReadbackLanding
                         lands[index] = !IsStored(page) && HashPage(current, index * PageBytes) == _pageHashes[page];
                         kept += lands[index] ? 0 : 1;
                     }
+
+                    decided?.Invoke();
+                    decided = null;
 
                     // Unchanged pages land in runs, one write per run.
                     for (var first = 0; first < pages;)
@@ -150,6 +166,8 @@ internal sealed class ReadbackLanding
                         first = end;
                     }
                 }
+
+                _landed = true;
             }
         }
         finally
