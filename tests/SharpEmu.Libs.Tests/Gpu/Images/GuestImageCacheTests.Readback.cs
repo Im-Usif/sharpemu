@@ -641,4 +641,73 @@ public sealed partial class GuestImageCacheTests
         Assert.Equal(0x11111111u, harness.ReadUInt32(address + 0x4000));
         harness.Shutdown();
     }
+
+    // A store the guest reports, through a write fault or a managed write, keeps its page over the readback even
+    // when it leaves the bytes as they were, such as zeros over memory that was zero. The other pages land. The
+    // first store unwatches the image, so a later one elsewhere goes unreported and the page comparison keeps it.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReportedStoreDuringReadback_KeepsItsPageEvenWithUnchangedBytes(bool fault)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var request = Color32(address, 8192);
+        var imageIdentifier = harness.Acquire(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111u)));
+        Assert.True(harness.Worker.Run(() => harness.Images.TryDownloadForTest(imageIdentifier)));
+
+        var store = address + 0x5000;
+        if (fault)
+        {
+            Assert.True(harness.WriteFault(store));
+        }
+        else
+        {
+            harness.Gpu.MarkCpuWrite(store, 8);
+        }
+
+        harness.Write(store, Bytes(0u, 0u));
+        harness.Write(address + 0x6000, Bytes(0x66666666u));
+        harness.Finish();
+
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address));
+        Assert.Equal(0u, harness.ReadUInt32(store));
+        Assert.Equal(0x66666666u, harness.ReadUInt32(address + 0x6000));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address + 0x7ffc));
+        harness.Shutdown();
+    }
+
+    // Write faults report stores to the pending readbacks, so reporting one allocates nothing. The image was
+    // evicted: it owns no pages, and the store goes no further than its readback.
+    [Fact]
+    public void StoreReportedToAnEvictedImagesReadback_AllocatesNothing()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var request = Color32(address, 8192);
+        var imageIdentifier = harness.Acquire(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111u)));
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, ulong.MaxValue, 81);
+            harness.Images.ResetRecency(new[] { imageIdentifier }, 81);
+            harness.Images.RunGarbageCollector();
+        });
+        Assert.False(harness.Images.Contains(imageIdentifier));
+
+        var store = address + 0x5000;
+        Assert.False(harness.ImageStore.MarkCpuWrite(store + 0x800, 8));
+        var allocated = GC.GetAllocatedBytesForCurrentThread();
+        Assert.False(harness.ImageStore.MarkCpuWrite(store, 8));
+        Assert.Equal(allocated, GC.GetAllocatedBytesForCurrentThread());
+        harness.Write(store, Bytes(0u, 0u));
+        harness.Finish();
+
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address));
+        Assert.Equal(0u, harness.ReadUInt32(store));
+        harness.Shutdown();
+    }
 }

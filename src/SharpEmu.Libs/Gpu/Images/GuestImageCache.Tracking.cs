@@ -376,6 +376,10 @@ public sealed partial class GuestImageCache
             return false;
         }
 
+        // Readbacks still to land keep the stored pages. An evicted image owns no pages, so they hear of the
+        // store before the owner checks, and outside the image lock.
+        _readbackLandings.NoteGuestStore(address, size);
+
         // Skip the lock only when neither image pages nor metadata can cover the write.
         if (!MayOwnPages(address, size) && !MayOverlapMetadata(address, size))
         {
@@ -422,6 +426,7 @@ public sealed partial class GuestImageCache
             throw SubmissionScheduler.Fatal($"The memory invalidation range is invalid: address=0x{address:X16} size=0x{size:X16}.");
         }
 
+        _readbackLandings.NoteGuestStore(address, size);
         using var held = _lock.Hold();
         InvalidateAliases(address, size);
     }

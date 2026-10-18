@@ -38,12 +38,24 @@ internal sealed class ReadbackLandings
             }
         }
     }
+
+    // A guest store reported before it lands: the readbacks still to land over it keep the pages it
+    // covers. Write faults report stores, so this walks the queue as it stands and allocates nothing.
+    public void NoteGuestStore(ulong address, ulong size)
+    {
+        foreach (var landing in Pending)
+        {
+            landing.NoteGuestStore(address, size);
+        }
+    }
 }
 
 // A readback lands in guest memory when its tick completes. By then the guest may have stored
 // into the same bytes, in memory a title freed and gave to its own data. On the console the
 // GPU's bytes reached memory first and the store replaced them, so a page whose bytes changed
 // since the readback was queued keeps the guest's bytes; the other pages take the readback.
+// A store the guest reports keeps its page even when it left the bytes as they were; comparing
+// pages catches the stores nobody reports, such as those into an evicted image.
 internal sealed class ReadbackLanding
 {
     private const int PageBytes = 4096;
@@ -54,6 +66,7 @@ internal sealed class ReadbackLanding
     private readonly ulong _address;
     private readonly int _size;
     private readonly ulong[] _pageHashes;
+    private readonly long[] _storedPages;
 
     internal ReadbackLanding(ReadbackLandings queue, ulong address, ReadOnlySpan<byte> snapshot)
     {
@@ -61,9 +74,27 @@ internal sealed class ReadbackLanding
         _address = address;
         _size = snapshot.Length;
         _pageHashes = new ulong[(snapshot.Length + PageBytes - 1) / PageBytes];
+        _storedPages = new long[(_pageHashes.Length + 63) / 64];
         for (var page = 0; page < _pageHashes.Length; page++)
         {
             _pageHashes[page] = HashPage(snapshot, page * PageBytes);
+        }
+    }
+
+    // Marks the pages of the readback that a reported guest store covers.
+    public void NoteGuestStore(ulong address, ulong size)
+    {
+        var end = _address + (ulong)_size;
+        if (address >= end || address + size <= _address)
+        {
+            return;
+        }
+
+        var first = (int)((Math.Max(address, _address) - _address) / PageBytes);
+        var last = (int)((Math.Min(address + size, end) - 1 - _address) / PageBytes);
+        for (var page = first; page <= last; page++)
+        {
+            Interlocked.Or(ref _storedPages[page / 64], 1L << (page % 64));
         }
     }
 
@@ -89,7 +120,8 @@ internal sealed class ReadbackLanding
                     var pages = (current.Length + PageBytes - 1) / PageBytes;
                     for (var index = 0; index < pages; index++)
                     {
-                        lands[index] = HashPage(current, index * PageBytes) == _pageHashes[windowStart / PageBytes + index];
+                        var page = windowStart / PageBytes + index;
+                        lands[index] = !IsStored(page) && HashPage(current, index * PageBytes) == _pageHashes[page];
                         kept += lands[index] ? 0 : 1;
                     }
 
@@ -178,6 +210,8 @@ internal sealed class ReadbackLanding
             }
         }
     }
+
+    private bool IsStored(int page) => (Volatile.Read(ref _storedPages[page / 64]) & (1L << (page % 64))) != 0;
 
     private void RehashPage(IGuestBackedSpace backing, int page)
     {
