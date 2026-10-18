@@ -1614,7 +1614,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         _tracker.UntrackMemory(buffer.CpuAddress, buffer.Size);
         Unregister(bufferIdentifier);
-        _registry.CompleteRetirement(bufferIdentifier);
+        CompleteRetirementAfterSubmittedWork(bufferIdentifier);
     }
 
     private void WriteDataBuffer(GpuBuffer buffer, ulong address, ReadOnlySpan<byte> source)
@@ -1683,6 +1683,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         Unregister(bufferIdentifier);
+        CompleteRetirementAfterSubmittedWork(bufferIdentifier);
+    }
+
+    // Unregistering clears the buffer's page-table entries only for work recorded from now
+    // on. Work already recorded or in flight can still reach it through its device address
+    // (an async readback waits only for its last recorded writer), so it is destroyed once
+    // that work completes.
+    private void CompleteRetirementAfterSubmittedWork(ResourceSlotIdentifier bufferIdentifier)
+    {
         if (_scheduler.Active)
         {
             _scheduler.QueueCompletionAction(() => _registry.CompleteRetirement(bufferIdentifier));
