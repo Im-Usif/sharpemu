@@ -207,6 +207,7 @@ public sealed partial class GpuCommandInterpreter
         }
 
         var stopDepth = execution.Depth;
+        ReadBehindEarlierWork(address);
         execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address));
         RunPackets(execution, stopDepth);
     }
@@ -215,9 +216,23 @@ public sealed partial class GpuCommandInterpreter
     private void ChainToBuffer(ulong address, uint dwordCount, bool followedChunkAdvance = false)
     {
         var execution = RequireExecution();
+        if (!followedChunkAdvance)
+        {
+            ReadBehindEarlierWork(address);
+        }
+
         execution.Pop();
         execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address, followedChunkAdvance));
         _chainRequested = true;
+    }
+
+    // Earlier work in the stream can build the buffer a packet calls or chains to (a GPU pass that writes
+    // a dispatch list). An operand read completes that work first, so the packets read next hold what it
+    // wrote. A ring chunk the guest still appends to is read as it is written.
+    private void ReadBehindEarlierWork(ulong address)
+    {
+        Span<byte> first = stackalloc byte[sizeof(uint)];
+        _ = _host.TryReadGuestOperand(address, first);
     }
 
     public void Suspend() => RequireExecution().Suspended = true;
