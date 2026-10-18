@@ -288,11 +288,13 @@ public sealed unsafe partial class CachedImage
         }
         else if (sourceType == ImageType.Type2D && destinationType == ImageType.Type3D)
         {
-            sourceLayers = depth;
+            // An array fills at most as many slices as it has layers, and a volume at most as many layers as it has
+            // slices.
+            sourceLayers = Math.Min(depth, source.Backing.Layers);
         }
         else if (sourceType == ImageType.Type3D && destinationType == ImageType.Type2D)
         {
-            destinationLayers = depth;
+            destinationLayers = Math.Min(depth, destination.Backing.Layers);
         }
 
         return (sourceLayers, destinationLayers);
@@ -309,6 +311,12 @@ public sealed unsafe partial class CachedImage
         _scheduler.EndRendering();
         var levels = Math.Min(source.Backing.MipLevels, Backing.MipLevels);
         var baseDepth = Backing.ImageType == ImageType.Type3D ? Backing.Extent.Depth : source.Backing.Extent.Depth;
+        if (source.Backing.ImageType == ImageType.Type3D)
+        {
+            // A deeper destination has slices the source never had.
+            baseDepth = Math.Min(baseDepth, source.Backing.Extent.Depth);
+        }
+
         var sourceAspect = ViewFormatRules.FullAspects(source.Backing.Format) & ~ImageAspectFlags.StencilBit;
         var destinationAspect = ViewFormatRules.FullAspects(Backing.Format) & ~ImageAspectFlags.StencilBit;
         var copies = new ImageCopy[levels];
