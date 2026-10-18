@@ -440,4 +440,56 @@ public sealed class MeshWaveDeviceTests(HeadlessVulkanFixture fixture) : IClassF
         }
         harness.AssertNoValidationMessages();
     }
+
+    // The thread group shares its LDS, so the lanes of a mesh shader that OR their own bit into one word must all be seen
+    // afterwards: a triangle marks itself in the mask of each of its vertices this way.
+    [Fact]
+    public void MeshLanesAccumulateBitsInOneSharedWord()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        if (!vulkan.SupportsMeshShaders || vulkan.SubgroupSize != 32)
+        {
+            Assert.False(GatePrerequisites.DeviceRequired, "This test requires mesh shaders with 32-lane subgroups.");
+            return;
+        }
+        var instructions = new List<Gen5ShaderInstruction>();
+        void Add(Gen5ShaderInstruction instruction) => instructions.Add(instruction with { Pc = (uint)instructions.Count * 8 });
+        Add(MoveScalar(0, 126, uint.MaxValue));
+        Add(MoveScalar(0, 127, uint.MaxValue));
+        Add(Vop3(0, "VMbcntLoU32B32", 2, Operand(uint.MaxValue), Operand(0)));
+        Add(Vop3(0, "VMbcntHiU32B32", 2, Operand(uint.MaxValue), Gen5Operand.Vector(2)));
+        // Lanes 0 to 31 share the word at byte 0, lanes 32 to 63 the word at byte 4; each lane owns one bit of its word.
+        Add(Vop2(0, "VLshrrevB32", 4, Operand(5), Gen5Operand.Vector(2)));
+        Add(Vop2(0, "VLshlrevB32", 4, Operand(2), Gen5Operand.Vector(4)));
+        Add(Vop2(0, "VLshlrevB32", 3, Gen5Operand.Vector(2), Operand(1)));
+        Add(MoveVector(0, 5, 0));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(4), Gen5Operand.Vector(5)], []));
+        Add(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Sopp, "SBarrier", [0], [], [], null));
+        Add(DataShare(0, "DsOrB32", false, [Gen5Operand.Vector(4), Gen5Operand.Vector(3)], []));
+        Add(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Sopp, "SBarrier", [0], [], [], null));
+        Add(DataShare(0, "DsReadB32", false, [Gen5Operand.Vector(4)], [10]));
+        Add(Vop2(0, "VLshlrevB32", 7, Operand(2), Gen5Operand.Vector(2)));
+        Add(BufferAccess(0, "BufferStoreDword", 8, vectorData: 10, offsetEnabled: true, vectorAddress: 7));
+        Add(EndProgram(0));
+        var (plan, resources, layout) = Prepare(Program([.. instructions]), ShaderStage.Mesh);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 64, LocalSizeX = 64,
+            Mesh = new MeshShaderConfiguration(64, 64, 0, 21, 63, 16, false, 32),
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        using var harness = new ImageTestHarness(vulkan);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv);
+        var output = runner.CreateBuffer(new byte[256]);
+        var registers = new uint[256];
+        registers[10] = 256;
+        harness.Run(() => runner.Dispatch(registers,
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [output] },
+            1, meshDrawParameters: [3, 0, 0, 0, 0, 0]));
+        var bytes = runner.ReadBack(output, 0, 256);
+        for (var lane = 0; lane < 64; lane++)
+            Assert.Equal(uint.MaxValue, BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(lane * 4)));
+        harness.AssertNoValidationMessages();
+    }
 }

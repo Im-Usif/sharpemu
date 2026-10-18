@@ -180,6 +180,7 @@ public static partial class Gen5SpirvTranslator
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
         private uint _lds;
+        private bool _ldsPrivate;
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
@@ -704,6 +705,7 @@ public static partial class Gen5SpirvTranslator
             var storageClass = _stage is Gen5SpirvStage.Compute or Gen5SpirvStage.Mesh
                 ? SpirvStorageClass.Workgroup
                 : SpirvStorageClass.Private;
+            _ldsPrivate = storageClass == SpirvStorageClass.Private;
             var dwordCount = _stage == Gen5SpirvStage.Mesh
                 ? _request.Mesh?.LocalDataShareDwords ?? 0
                 : _stage == Gen5SpirvStage.Compute ? ComputeLdsGuestDwordCount() : PrivateLdsDwordCount;
@@ -2470,9 +2472,9 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     // The LDS is an array of dwords: replace the byte or half-word the address selects. Lanes of
-                    // a compute workgroup write neighbouring bytes of one dword, so the shared array is updated
-                    // with an AND that clears the field and an OR that sets it (EmitLdsAtomic is a plain
-                    // read-modify-write on the Private array of a graphics stage).
+                    // a compute or mesh workgroup write neighbouring bytes of one dword, so the shared array is
+                    // updated with an AND that clears the field and an OR that sets it (EmitLdsAtomic is a plain
+                    // read-modify-write on the Private array of a vertex or pixel stage).
                     var halfWord = instruction.Opcode is "DsWriteB16" or "DsWriteB16D16Hi";
                     var writeAddress = GetRawSource(instruction, 0);
                     var writeByteAddress = control.SingleOffsetBytes == 0
@@ -2495,8 +2497,16 @@ public static partial class Gen5SpirvTranslator
                     var fieldPointer = LdsPointer(writeAddress, control.SingleOffsetBytes);
                     EmitExecConditional(() =>
                     {
-                        EmitLdsAtomic(SpirvOp.AtomicAnd, fieldPointer, value: () => clearMask, comparator: () => clearMask);
-                        EmitLdsAtomic(SpirvOp.AtomicOr, fieldPointer, value: () => fieldValue, comparator: () => fieldValue);
+                        uint Merge(uint observed) => BitwiseOr(BitwiseAnd(observed, clearMask), fieldValue);
+                        if (_ldsPrivate)
+                        {
+                            Store(fieldPointer, Merge(Load(_uintType, fieldPointer)));
+                            return;
+                        }
+
+                        // One compare-exchange per lane replaces the whole field: two lanes that store into the same
+                        // field leave one of their values, as on the hardware, not the OR of both.
+                        EmitAtomicWordUpdate(fieldPointer, Merge, scope: 2);
                     });
                     return true;
                 }
@@ -3005,7 +3015,8 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 1),
                         instruction.Opcode == "DsMaxF32",
                         scope: 2,
-                        semantics: 0x108));
+                        semantics: 0x108,
+                        privateMemory: _ldsPrivate));
                 return true;
             }
 
@@ -3068,9 +3079,11 @@ public static partial class Gen5SpirvTranslator
             uint data,
             bool maxValue,
             uint scope,
-            uint semantics)
+            uint semantics,
+            bool privateMemory)
         {
-            if (_stage != Gen5SpirvStage.Compute)
+            // Atomics are invalid on a Private LDS array (see EmitLdsAtomic); the GDS is shared in every stage.
+            if (privateMemory)
             {
                 var current = Load(_uintType, pointer);
                 Store(
@@ -3306,16 +3319,16 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // The LDS of a graphics stage is a per-invocation Private array (see DeclareLds). SPIR-V atomics are invalid on Private
-        // memory and the driver's pipeline compiler can crash on them. Nothing else can reach that array, so there the operation
-        // is a plain read-modify-write that returns the original value.
+        // The LDS of a vertex or pixel stage is a per-invocation Private array (see DeclareLds). SPIR-V atomics are invalid on
+        // Private memory and the driver's pipeline compiler can crash on them. Nothing else can reach that array, so there the
+        // operation is a plain read-modify-write that returns the original value. Compute and mesh lanes share theirs.
         private uint EmitLdsAtomic(
             SpirvOp op,
             uint pointer,
             Func<uint> value,
             Func<uint> comparator)
         {
-            if (_stage == Gen5SpirvStage.Compute)
+            if (!_ldsPrivate)
             {
                 return EmitAtomic(op, _uintType, pointer, scope: 2, semantics: 0x108, value, comparator);
             }
@@ -5087,7 +5100,7 @@ public static partial class Gen5SpirvTranslator
         // exchange succeeds. Returns the observed (pre-exchange) word at the
         // point the loop exits, which is a valid use here because it is
         // defined by the OpPhi in `header`, and `header` dominates `mergeLabel`.
-        private uint EmitAtomicWordUpdate(uint pointer, Func<uint, uint> merge)
+        private uint EmitAtomicWordUpdate(uint pointer, Func<uint, uint> merge, uint scope = 1)
         {
             var preheader = _module.AllocateId();
             var header = _module.AllocateId();
@@ -5096,7 +5109,7 @@ public static partial class Gen5SpirvTranslator
             var exchanged = _module.AllocateId();
             _module.AddStatement(SpirvOp.Branch, preheader);
             _module.AddLabel(preheader);
-            var initial = _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, pointer, UInt(1), UInt(0));
+            var initial = _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, pointer, UInt(scope), UInt(0));
             _module.AddStatement(SpirvOp.Branch, header);
             _module.AddLabel(header);
             var observed = _module.AddInstruction(
@@ -5113,7 +5126,7 @@ public static partial class Gen5SpirvTranslator
                 _uintType,
                 exchanged,
                 pointer,
-                UInt(1),
+                UInt(scope),
                 UInt(0),
                 UInt(0),
                 next,

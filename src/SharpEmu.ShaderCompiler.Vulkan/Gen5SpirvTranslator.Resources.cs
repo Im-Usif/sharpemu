@@ -2070,7 +2070,8 @@ public static partial class Gen5SpirvTranslator
                             GetRawSource(instruction, 1),
                             instruction.Opcode == "DsMaxF32",
                             scope: 1,
-                            semantics: 0x48));
+                            semantics: 0x48,
+                            privateMemory: false));
                 });
                 return true;
             }
