@@ -568,6 +568,64 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         presenter.Harness.Shutdown();
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NullTexture_ForAVolume_IsAThreeDimensionalView(bool storage)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var texture = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, storage,
+            Descriptor: [], Shape: new ShaderImageShape(true, false, storage, false, TextureNumericClass.Float));
+
+        var resource = presenter.Run(() => AcquireTexture(presenter, texture));
+        Assert.NotEqual(0UL, ((ImageView)GetFieldValue(resource, "View")).Handle);
+        var request = (ImageRequest)GetFieldValue(resource, "Request");
+        Assert.Equal(ImageViewType.Type3D, request.View.Type);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    // A null descriptor of a one-dimensional image binds a one-dimensional placeholder: a 1D view cannot be taken from
+    // a 2D image.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NullTexture_ForAOneDimensionalImage_IsAOneDimensionalView(bool storage)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var texture = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, storage,
+            Descriptor: [], Shape: new ShaderImageShape(false, false, storage, false, TextureNumericClass.Float) with { OneDimensional = true });
+
+        var resource = presenter.Run(() => AcquireTexture(presenter, texture));
+        Assert.NotEqual(0UL, ((ImageView)GetFieldValue(resource, "View")).Handle);
+        var request = (ImageRequest)GetFieldValue(resource, "Request");
+        Assert.Equal(ImageViewType.Type1D, request.View.Type);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    // A null descriptor of a multisampled image binds a placeholder with the samples the shader declares.
+    [Fact]
+    public void NullTexture_ForAMultisampledImage_IsMultisampled()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var texture = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, false,
+            Descriptor: [], Shape: new ShaderImageShape(false, false, false, false, TextureNumericClass.Float) with { Multisampled = true });
+
+        var resource = presenter.Run(() => AcquireTexture(presenter, texture));
+        var request = (ImageRequest)GetFieldValue(resource, "Request");
+        var image = (CachedImage)GetFieldValue(resource, "CachedImage");
+        Assert.Equal(request.Description.Samples, image.Backing.Samples);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
     [Fact]
     public void NullTexture_ForDepthReferenceSampling_IsADepthView()
     {
