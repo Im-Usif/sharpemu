@@ -138,7 +138,7 @@ public static partial class Gen5SpirvTranslator
         }
 
         private static bool IsPairedLaneInstruction(Gen5ShaderInstruction instruction) =>
-            instruction.Opcode is not ("VReadlaneB32" or "VReadfirstlaneB32" or "DsAppend" or "DsConsume") &&
+            instruction.Opcode is not ("VReadlaneB32" or "VReadfirstlaneB32" or "DsAppend" or "DsConsume" or "DsOrderedCount") &&
             instruction.Encoding is
                 Gen5ShaderEncoding.Mubuf or
                 Gen5ShaderEncoding.Mtbuf or
@@ -584,7 +584,7 @@ public static partial class Gen5SpirvTranslator
                 Gen5ShaderEncoding.Smem or Gen5ShaderEncoding.Smrd)
                 return TryEmitInstruction(instruction, out error);
 
-            if (instruction.Opcode is "DsAppend" or "DsConsume" or "DsSwizzleB32")
+            if (instruction.Opcode is "DsAppend" or "DsConsume" or "DsOrderedCount" or "DsSwizzleB32")
             {
                 error = "This cross-lane operation has no paired mesh implementation.";
                 return false;
