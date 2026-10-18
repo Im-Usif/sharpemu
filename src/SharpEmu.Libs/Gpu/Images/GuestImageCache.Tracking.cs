@@ -529,7 +529,7 @@ public sealed partial class GuestImageCache
                 var range = image.Description.Data;
                 if (image.IsGpuModified && !image.DepthOwner.IsValid && image.Overlaps(address, size) &&
                     (address > range.Address || address + size < range.Address + range.Size) &&
-                    image.SafeToDownload && !image.RawWriteAfterGpuWrite)
+                    image.SafeToDownload && !image.RawWriteAfterGpuWrite && !HasNewerHandedOverImage(imageIdentifier, image))
                 {
                     (partlyWritten ??= []).Add(imageIdentifier);
                 }
@@ -560,10 +560,47 @@ public sealed partial class GuestImageCache
 
             using (var held = _lock.Hold())
             {
-                if (_slots.TryGet(imageIdentifier) is { IsGpuModified: true } image && TryDownloadImageToBuffer(image, buffer))
+                // The buffer was obtained outside the lock, which can land held writes and run completed work:
+                // the image must still be safe to download and the newest owner of its bytes.
+                if (_slots.TryGet(imageIdentifier) is { IsGpuModified: true, SafeToDownload: true, RawWriteAfterGpuWrite: false } image &&
+                    !HasNewerHandedOverImage(imageIdentifier, image) && TryDownloadImageToBuffer(image, buffer))
                 {
                     image.ClearGpuModified();
+                    MarkOlderOverlappingImagesOverwritten(imageIdentifier, image);
                 }
+            }
+        }
+    }
+
+    // A newer GPU-written image over the same memory that has already handed its bytes to the buffer (or lost
+    // them to a CPU write): publishing this older image would put its stale contents over them. Newer images
+    // that still hold their bytes publish after this one, oldest first. The caller holds the lock.
+    private bool HasNewerHandedOverImage(ResourceSlotIdentifier imageIdentifier, CachedImage image)
+    {
+        var range = image.Description.Data;
+        foreach (var otherIdentifier in FindImagesInRange(range.Address, range.Size, pageOverlap: false))
+        {
+            if (otherIdentifier != imageIdentifier && _slots.TryGet(otherIdentifier) is { IsGpuModified: false } other &&
+                other.DepthOwner != imageIdentifier && other.GpuWriteSequence > image.GpuWriteSequence && other.Overlaps(range.Address, range.Size))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // After a publish the buffer holds this image's bytes over its whole range; an older GPU-written image
+    // over the same memory must not publish its contents over them later. The caller holds the lock.
+    private void MarkOlderOverlappingImagesOverwritten(ResourceSlotIdentifier imageIdentifier, CachedImage image)
+    {
+        var range = image.Description.Data;
+        foreach (var otherIdentifier in FindImagesInRange(range.Address, range.Size, pageOverlap: false))
+        {
+            if (otherIdentifier != imageIdentifier && _slots.TryGet(otherIdentifier) is { IsGpuModified: true } other &&
+                other.GpuWriteSequence < image.GpuWriteSequence && other.Overlaps(range.Address, range.Size))
+            {
+                other.MarkRawWriteAfterGpuWrite();
             }
         }
     }

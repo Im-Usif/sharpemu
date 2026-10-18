@@ -193,6 +193,43 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A newer GPU-written image that partly covers an older one publishes first, on a write only it covers. A later
+    // write that only the older image covers must not put the older image's stale bytes over the newer image's.
+    [Fact]
+    public void PartialWriteOverAnOlderImage_KeepsTheBytesANewerImagePublishedEarlier()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var older = Color32(address, 4096);
+        var newer = Color32(address + 0x2000, 4096);
+        var olderId = harness.Acquire(ref older);
+        var newerId = harness.Acquire(ref newer);
+        Assert.NotEqual(olderId, newerId);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x4000, 0x11111111)));
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address + 0x2000, 0x4000, 0x22222222)));
+        Assert.True(harness.Image(olderId).IsGpuModified);
+        Assert.True(harness.Image(newerId).IsGpuModified);
+
+        foreach (var (writeAddress, value) in new[] { (address + 0x5000, 0x55555555u), (address + 0x1000, 0x66666666u) })
+        {
+            harness.Worker.Run(() =>
+            {
+                harness.Images.InvalidateMemoryFromGpu(writeAddress, 4);
+                var (bound, offset) = harness.Cache.ObtainBuffer(writeAddress, 4, isWritten: true, isTexelBuffer: true);
+                bound.Fill(offset, 4, value);
+            });
+        }
+
+        Assert.True(harness.Cache.DownloadToCpu(address, 0x6000));
+        Assert.Equal(0x66666666u, harness.ReadUInt32(address + 0x1000));
+        Assert.Equal(0x22222222u, harness.ReadUInt32(address + 0x2000));
+        Assert.Equal(0x22222222u, harness.ReadUInt32(address + 0x3ffc));
+        Assert.Equal(0x22222222u, harness.ReadUInt32(address + 0x4000));
+        Assert.Equal(0x55555555u, harness.ReadUInt32(address + 0x5000));
+        harness.Shutdown();
+    }
+
     // A shader writes a plain buffer that lies inside a GPU-written image (a light grid placed in the memory of a
     // finished shadow mask). The image hands its bytes over first, so a later publish of it, triggered by a
     // formatted write elsewhere in its range, cannot put its old contents over the shader's bytes.
