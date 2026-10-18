@@ -44,6 +44,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly IGpuQueueRelay _relay;
     private readonly GuestBufferUploader _uploader;
     private readonly IGuestBackedSpace _backing;
+    private readonly ICpuMemory _guest;
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
     private readonly GpuBuffer _bdaPageTable;
@@ -74,6 +75,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _scheduler = scheduler;
         _relay = relay;
         _backing = backing;
+        _guest = guest;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
         _gds = new GpuBuffer(device, scheduler, GpuBufferUsage.Stream, 0, GpuBuffer.AllFlags, GdsBufferSize);
         _bdaPageTable = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, BdaPageTableSize);
@@ -731,6 +733,33 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public bool HasCpuDirtyPages(ulong guestAddress, ulong size) => _tracker.HasCpuDirtyPages(guestAddress, size);
 
     public void ProcessFaultBuffer() => _faults.ProcessFaultBuffer();
+
+    // The registered guest memory; a device-address fault inside it brings in the window around the page.
+    internal GuestGpuMemory? GpuMemory { get; set; }
+
+    // A shader reaches some memory only through pointers it reads on the GPU, such as the nodes of a
+    // ray-tracing structure, and walks it a page at a time. A page the cache does not hold reads zeros and
+    // drops stores until the fault is processed, so a fault brings in the aligned window around the page,
+    // clipped to its registered span. A window the guest cannot read in one piece keeps the single page.
+    internal const ulong DeviceAddressFaultWindow = 2 * MiB;
+
+    internal GuestSpan DeviceAddressFaultRange(ulong pageAddress, ulong pageSize)
+    {
+        if (GpuMemory is { } memory && memory.TryGetSpan(pageAddress, out var spanStart, out var spanEnd))
+        {
+            var windowStart = pageAddress & ~(DeviceAddressFaultWindow - 1);
+            var start = Math.Max(windowStart, spanStart);
+            var end = Math.Min(windowStart + DeviceAddressFaultWindow, spanEnd);
+            if (pageAddress + pageSize <= end && _guest.CanRead(start, end - start))
+            {
+                return new GuestSpan(start, end - start);
+            }
+        }
+
+        return new GuestSpan(pageAddress, pageSize);
+    }
+
+    internal bool CanReadGuest(ulong address, ulong size) => _guest.CanRead(address, size);
 
     // Uploads every mapped range before a BDA draw; the fault pass runs at the next collection.
     // Every device-address program prepares all GPU-mapped memory; visiting each registered

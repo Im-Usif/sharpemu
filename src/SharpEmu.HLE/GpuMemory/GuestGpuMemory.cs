@@ -178,6 +178,13 @@ public sealed class GuestGpuMemory : IDisposable
         return snapshot.Contains(address, size);
     }
 
+    // The registered span that holds the address.
+    public bool TryGetSpan(ulong address, out ulong start, out ulong end)
+    {
+        var snapshot = Volatile.Read(ref _spanSnapshot) ?? throw new ObjectDisposedException(nameof(GuestGpuMemory));
+        return snapshot.TryGetContaining(address, out start, out end);
+    }
+
     public void ForEachSpan(Action<ulong, ulong> visit)
     {
         _spansLock.EnterReadLock();

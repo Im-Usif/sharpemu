@@ -1414,4 +1414,109 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         Assert.Equal(2u, BitConverter.ToUInt32(harness.ReadBack(again, againOffset, 4)));
         harness.Shutdown();
     }
+
+    [Fact]
+    public void ProcessFaultBuffer_BringsInTheWindowAroundAFaultedPage()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        harness.Cache.GpuMemory = harness.Gpu;
+        const ulong window = GuestBufferCache.DeviceAddressFaultWindow;
+        var address = harness.MapBacked(3 * window, ReadWrite);
+        var windowStart = (address + window - 1) & ~(window - 1);
+        var page = (windowStart + window / 2) >> GuestBufferCache.CachingPageBits;
+        harness.Worker.Run(() =>
+        {
+            var staging = harness.Cache.GetUtilityBuffer(GpuBufferUsage.Upload);
+            var offset = staging.Copy(BitConverter.GetBytes(1u << (int)(page % 32)), 4);
+            harness.Cache.FaultBuffer.CopyFrom(harness.Scheduler.Current, staging, offset, page / 32 * 4, 4, Silk.NET.Vulkan.AccessFlags.HostWriteBit);
+            harness.Cache.ProcessFaultBuffer();
+            harness.Scheduler.Finish();
+        });
+
+        Assert.Equal(1, harness.Cache.BufferCount);
+        Assert.True(harness.Cache.IsRegionRegistered(windowStart, Page));
+        Assert.True(harness.Cache.IsRegionRegistered(windowStart + window - Page, Page));
+        Assert.False(harness.Cache.IsRegionRegistered(windowStart + window, Page));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void DeviceAddressFaultRange_StaysInsideTheRegisteredSpan()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        harness.Cache.GpuMemory = harness.Gpu;
+        var address = harness.MapBacked(0x40000, ReadWrite);
+
+        var range = harness.Cache.DeviceAddressFaultRange(address + 0x8000, Page);
+        Assert.True(range.Address >= address && range.Address + range.Size <= address + 0x40000);
+        Assert.True(range.Size > Page);
+        Assert.Equal(new GuestSpan(address + 0x100000, Page), harness.Cache.DeviceAddressFaultRange(address + 0x100000, Page));
+        harness.Shutdown();
+    }
+
+    // Backed memory followed by private memory is one registered span, but no single read covers both:
+    // the uploader would fail on the window, so the fault keeps its page.
+    [Fact]
+    public void DeviceAddressFaultRange_KeepsThePageWhenTheGuestCannotReadTheWindow()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        harness.Cache.GpuMemory = harness.Gpu;
+        var backed = harness.MapBacked(0x40000, ReadWrite);
+        var unbacked = harness.MapPrivate(0x40000);
+        Assert.Equal(backed + 0x40000, unbacked);
+        Assert.False(harness.Memory.CanRead(backed, 0x80000));
+
+        Assert.Equal(new GuestSpan(backed + 0x8000, Page), harness.Cache.DeviceAddressFaultRange(backed + 0x8000, Page));
+        harness.Shutdown();
+    }
+
+    // Faults of one scan in the adjacent windows of two mappings: each window reads in one piece, but the scan's
+    // ranges join them into one that does not, so each window keeps its own buffer and the next upload of the
+    // device-address preparation reads them apart.
+    [Fact]
+    public void ProcessFaultBuffer_KeepsAdjacentWindowsOfTwoMappingsApart()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        harness.Cache.GpuMemory = harness.Gpu;
+        const ulong window = GuestBufferCache.DeviceAddressFaultWindow;
+        var backed = harness.MapBacked(window, ReadWrite);
+        var unbacked = harness.MapPrivate(window);
+        Assert.Equal(backed + window, unbacked);
+        Assert.Equal(0UL, backed % window);
+        Assert.Equal(window, unbacked % TrackerLayout.BlockBytes);
+        Assert.False(harness.Memory.CanRead(backed, 2 * window));
+        Assert.Equal(new GuestSpan(backed, window), harness.Cache.DeviceAddressFaultRange(backed + 8 * Page, Page));
+        Assert.Equal(new GuestSpan(unbacked, window), harness.Cache.DeviceAddressFaultRange(unbacked + 8 * Page, Page));
+
+        harness.Worker.Run(() =>
+        {
+            FlagFault(harness, backed + 8 * Page);
+            FlagFault(harness, unbacked + 8 * Page);
+            harness.Cache.ProcessFaultBuffer();
+            harness.Scheduler.Finish();
+        });
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.PrepareBda([new GuestSpan(backed, 2 * window)]);
+            harness.Scheduler.Finish();
+        });
+
+        Assert.Empty(fatal.Messages);
+        Assert.Equal(2, harness.Cache.BufferCount);
+        harness.Shutdown();
+    }
+
+    private static void FlagFault(CacheHarness harness, ulong address)
+    {
+        var page = address >> GuestBufferCache.CachingPageBits;
+        var staging = harness.Cache.GetUtilityBuffer(GpuBufferUsage.Upload);
+        var offset = staging.Copy(BitConverter.GetBytes(1u << (int)(page % 32)), 4);
+        harness.Cache.FaultBuffer.CopyFrom(harness.Scheduler.Current, staging, offset, page / 32 * 4, 4,
+            Silk.NET.Vulkan.AccessFlags.HostWriteBit);
+    }
 }
