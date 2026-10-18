@@ -572,7 +572,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             return;
         }
 
-        var perDestination = scalarDestinations.Count > 1 ? 1u : instruction.DestinationWidth;
+        // A vector compare or carry writes a lane mask: one SGPR in a wave32 wave.
+        var perDestination = scalarDestinations.Count > 1 || instruction.Encoding is Gen5ShaderEncoding.Vopc or
+            Gen5ShaderEncoding.Vop3 ? 1u : instruction.DestinationWidth;
         foreach (var destination in scalarDestinations)
         {
             for (uint index = 0; index < perDestination && destination.Value + index < ScalarRegisterCount; index++)
