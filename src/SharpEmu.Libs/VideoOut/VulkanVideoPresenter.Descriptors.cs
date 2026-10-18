@@ -20,6 +20,14 @@ using VkBuffer = Silk.NET.Vulkan.Buffer;
 // This partial binds the resources of one stage: storage buffers, images, samplers and push data.
 internal static unsafe partial class VulkanVideoPresenter
 {
+    // The shader bounds a storage binding in whole dwords (OpArrayLength), so the view ends on a dword: a 16-bit element
+    // in the binding's last partial dword stays in range. A view that would not fit keeps its exact size.
+    internal static ulong StorageBufferViewRange(ulong bytes, ulong available, ulong maxRange)
+    {
+        var rounded = (bytes + 3) & ~3UL;
+        return rounded <= available && rounded <= maxRange ? rounded : bytes;
+    }
+
     private sealed partial class Presenter
     {
         private const ulong NullStorageBufferBytes = 16;
@@ -691,8 +699,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier, program.Hash);
             TraceBufferParameter(program.Hash, slot, address, size, buffer.Handle.Handle, offset, resource.Written);
             var alignedOffset = offset - offset % alignment;
+            // The shader adds the adjustment to its byte address, so a base that is only two byte aligned
+            // keeps the byte phase the guest's 16 bit accesses expect.
             var adjustment = offset - alignedOffset;
-            if (adjustment % sizeof(uint) != 0 || adjustment >= MaxMemoryOffsetAdjustment || size > maxRange - adjustment)
+            if (adjustment >= MaxMemoryOffsetAdjustment || size > maxRange - adjustment)
             {
                 throw SubmissionScheduler.Fatal($"A storage buffer offset adjustment is unsupported: buffer={slot} adjustment={adjustment} hash=0x{program.Hash:X16}.");
             }
@@ -707,7 +717,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _imageCache.InvalidateMemoryCopiesFromGpu(address, size);
             }
 
-            return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
+            return new BufferView(buffer.Handle, alignedOffset,
+                StorageBufferViewRange(size + adjustment, buffer.Size - alignedOffset, maxRange));
         }
 
         private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program)

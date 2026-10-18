@@ -889,7 +889,10 @@ public static partial class Gen5SpirvTranslator
                     if (entry.Resource != MemoryAccessInfo.NoResource)
                     {
                         var bindingIndex = (int)entry.Resource;
-                        var byteAddress = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
+                        // A scalar load ignores the two low bits of the base and of the offset alike.
+                        var byteAddress = BitwiseAnd(
+                            IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint)))),
+                            UInt(~3u));
                         byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
                         value = LoadBufferWord(bindingIndex, ShiftRightLogical(byteAddress, UInt(2)));
                     }
