@@ -285,6 +285,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return (buffer, buffer.Offset(guestAddress));
     }
 
+    // The image cache publishes an image's GPU-only contents into the buffer over the same bytes before a
+    // partial write drops them; the buffer then owns them, as after any GPU write. Null without backing.
+    public GpuBuffer? ObtainBufferForImageWriteBack(ulong guestAddress, ulong size)
+    {
+        if (!IsValidRange(guestAddress, size) || !_backing.IsBackedRange(guestAddress, size))
+        {
+            return null;
+        }
+
+        return ObtainBuffer(guestAddress, size, isWritten: true).Buffer;
+    }
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
     {
         CompleteGuestPublications?.Invoke(guestAddress, size, PublicationAccess.Read);

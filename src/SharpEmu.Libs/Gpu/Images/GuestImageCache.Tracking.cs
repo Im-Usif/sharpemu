@@ -479,6 +479,7 @@ public sealed partial class GuestImageCache
             return;
         }
 
+        PublishPartlyWrittenImages(address, size);
         using var held = _lock.Hold();
         if (ImageClearTrace.Enabled)
             _metadataHistory.RecordRange(CreateMetadataEvent("gpu-write-notification", address, size));
@@ -497,6 +498,55 @@ public sealed partial class GuestImageCache
             }
 
             image.MarkBufferModified();
+        }
+    }
+
+    // A write over part of a GPU-modified image leaves the image's other bytes in memory: its GPU-only
+    // contents move into the buffer over its range first, so its next upload, or another image over those
+    // bytes, starts from them instead of stale guest memory. The buffer is obtained outside the lock;
+    // contents that cannot be copied are lost as before.
+    private void PublishPartlyWrittenImages(ulong address, ulong size)
+    {
+        List<ResourceSlotIdentifier>? partlyWritten = null;
+        using (var held = _lock.Hold())
+        {
+            foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false))
+            {
+                var image = _slots[imageIdentifier];
+                var range = image.Description.Data;
+                if (image.IsGpuModified && !image.DepthOwner.IsValid && image.Overlaps(address, size) &&
+                    (address > range.Address || address + size < range.Address + range.Size) && CanReadBack(image))
+                {
+                    (partlyWritten ??= []).Add(imageIdentifier);
+                }
+            }
+        }
+
+        foreach (var imageIdentifier in partlyWritten ?? [])
+        {
+            GuestSpan range;
+            using (var held = _lock.Hold())
+            {
+                if (_slots.TryGet(imageIdentifier) is not { IsGpuModified: true } image)
+                {
+                    continue;
+                }
+
+                range = image.Description.Data;
+            }
+
+            if (_bufferCache.ObtainBufferForImageWriteBack(range.Address, range.Size) is not { } buffer)
+            {
+                continue;
+            }
+
+            using (var held = _lock.Hold())
+            {
+                if (_slots.TryGet(imageIdentifier) is { IsGpuModified: true } image && TryDownloadImageToBuffer(image, buffer))
+                {
+                    image.ClearGpuModified();
+                }
+            }
         }
     }
 

@@ -113,6 +113,37 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A typed buffer write over part of a GPU-modified image (an engine's transient allocator reusing memory
+    // inside a frame) leaves the image's other bytes in memory: they reach the buffer first, so the image's
+    // next upload keeps them instead of reading stale guest memory.
+    [Fact]
+    public void PartialBufferWriteOverGpuImage_KeepsTheImagesOtherBytes()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var image = Color32(address, 8192);
+        var imageId = harness.Acquire(ref image);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111)));
+        Assert.True(harness.Image(imageId).IsGpuModified);
+
+        var writeAddress = address + 0x3000;
+        harness.Worker.Run(() =>
+        {
+            harness.Images.InvalidateMemoryFromGpu(writeAddress, 4);
+            var (bound, offset) = harness.Cache.ObtainBuffer(writeAddress, 4, isWritten: true, isTexelBuffer: true);
+            bound.Fill(offset, 4, 0x55667788);
+        });
+
+        var again = Color32(address, 8192);
+        Assert.Equal(imageId, harness.Acquire(ref again));
+        var pixels = harness.ReadImageBytes(harness.Image(imageId));
+        Assert.Equal(0x11111111u, BitConverter.ToUInt32(pixels, 0));
+        Assert.Equal(0x55667788u, BitConverter.ToUInt32(pixels, 0x3000));
+        Assert.Equal(0x11111111u, BitConverter.ToUInt32(pixels, 0x7FFC));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void FullColorClear_SkipsSourceBufferAndRetainsWriteObservation()
     {
