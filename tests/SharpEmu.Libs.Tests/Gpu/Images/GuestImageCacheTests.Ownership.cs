@@ -234,6 +234,41 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // Memory a title reuses holds GPU-written buffer bytes from before an image was rendered over it. A write
+    // over part of the image still publishes the image: its contents are newer than those bytes.
+    [Fact]
+    public void PartialWriteOverGpuImage_PublishesItOverOlderBufferWrites()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            var (bound, offset) = harness.Cache.ObtainBuffer(address + 0x6000, 0x100, isWritten: true);
+            bound.Fill(offset, 0x100, 0x44444444);
+        });
+
+        var image = Color32(address, 8192);
+        var imageId = harness.Acquire(ref image);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11111111)));
+        Assert.True(harness.Image(imageId).IsGpuModified);
+
+        var writeAddress = address + 0x3000;
+        harness.Worker.Run(() =>
+        {
+            harness.Images.InvalidateMemoryFromGpu(writeAddress, 4);
+            var (bound, offset) = harness.Cache.ObtainBuffer(writeAddress, 4, isWritten: true, isTexelBuffer: true);
+            bound.Fill(offset, 4, 0x55667788);
+        });
+
+        Assert.True(harness.Cache.DownloadToCpu(address, 0x8000));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address));
+        Assert.Equal(0x55667788u, harness.ReadUInt32(writeAddress));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address + 0x6000));
+        Assert.Equal(0x11111111u, harness.ReadUInt32(address + 0x7FFC));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void FullColorClear_SkipsSourceBufferAndRetainsWriteObservation()
     {
