@@ -905,4 +905,30 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
 
         Assert.All(Run(sizeX: 16, sizeY: 1), value => Assert.Equal(10u | (16u << 8), value));
     }
+
+    // A compiler spills a scalar to a VGPR lane with V_WRITELANE and reads it back with V_READLANE whichever threads run:
+    // the lane keeps the value although its own thread does not run, in either wave64 lowering. Six threads run here, so neither the invocation
+    // that holds lanes 20 and 52 nor the one that holds lanes 18 and 50 runs.
+    [Theory]
+    [InlineData(3u)]
+    [InlineData(20u)]
+    [InlineData(50u)]
+    public void AScalarSpilledToALaneOfAPartialWave_ReadsBack(uint lane)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(MoveScalar(0, 20, 0x1234));
+        Add(WriteLane(0, 40, 20, lane));
+        // The reload sits in a later block, as a spill and its reload usually do.
+        var jump = Add(Branch(0, "SBranch", 0));
+        var reload = Add(ReadLane(0, 21, 40, lane));
+        Point(jump, reload);
+        Add(MoveVectorFromScalar(0, 4, 21));
+
+        var lanes = Run(sizeX: 64, sizeY: 1, dispatchLimits: [(6, 1)]);
+        for (uint thread = 0; thread < 64; thread++)
+        {
+            Assert.Equal(thread < 6 ? 0x1234u : 0u, lanes[thread]);
+        }
+    }
 }

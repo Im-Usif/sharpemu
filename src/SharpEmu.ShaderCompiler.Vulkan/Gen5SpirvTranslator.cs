@@ -8043,11 +8043,6 @@ public static partial class Gen5SpirvTranslator
         private List<(uint Register, uint Lane)> FindLaneSpillSlots()
         {
             var slots = new List<(uint Register, uint Lane)>();
-            if (_stage == Gen5SpirvStage.Compute && (_waveLowering is EmulatedWave64Lowering || _pairedLanes))
-            {
-                return slots;
-            }
-
             var ownsLaneZero = !UsesSubgroupOperations();
             var readRegisters = _request.Program.Instructions
                 .Where(static instruction => instruction.Opcode == "VReadlaneB32" &&

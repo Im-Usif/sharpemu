@@ -5596,17 +5596,22 @@ public static partial class Gen5SpirvTranslator
             var selectedLane = BitwiseAnd(GetRawSource(instruction, 1), UInt(LaneSelectMask));
             if (_pairedLanes)
             {
-                StoreS(destination, PairedReadLane(instruction, selectedLane));
+                StoreS(destination, PairedReadLaneOrSpillSlot(instruction, selectedLane));
                 return true;
             }
 
             var sourceValue = GetRawSource(instruction, 0);
 
-            if (_stage == Gen5SpirvStage.Compute && _waveLowering is EmulatedWave64Lowering)
+            if (_stage == Gen5SpirvStage.Compute && _waveLowering is EmulatedWave64Lowering emulated)
             {
                 // The selected guest lane can belong to another host subgroup.
                 // Read it even when the guest execution mask disables that lane.
-                StoreS(destination, BroadcastWaveLane(sourceValue, selectedLane));
+                // A lane past the thread count does not run; a scalar V_WRITELANE spilled to it is in the spill slot.
+                var broadcast = BroadcastWaveLane(sourceValue, selectedLane);
+                var spilled = ReadLaneSpillSlot(instruction, selectedLane, broadcast);
+                StoreS(destination, spilled == broadcast
+                    ? broadcast
+                    : _module.AddInstruction(SpirvOp.Select, _uintType, emulated.LaneRuns(selectedLane), broadcast, spilled));
             }
             else if (_subgroupInvocationIdInput != 0 && _stage == Gen5SpirvStage.Compute)
             {

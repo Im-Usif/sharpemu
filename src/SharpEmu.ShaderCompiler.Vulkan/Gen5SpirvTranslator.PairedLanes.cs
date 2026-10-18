@@ -344,6 +344,22 @@ public static partial class Gen5SpirvTranslator
                 SubgroupBroadcast(upperValue, lane));
         }
 
+        // A pair of lanes past the group's thread count has no running invocation to read, but a scalar that V_WRITELANE
+        // spilled to either lane is in every invocation's spill slot.
+        private uint PairedReadLaneOrSpillSlot(Gen5ShaderInstruction instruction, uint selectedLane)
+        {
+            var value = PairedReadLane(instruction, selectedLane);
+            var spilled = ReadLaneSpillSlot(instruction, selectedLane, value);
+            if (spilled == value)
+            {
+                return value;
+            }
+
+            var pairBit = ShiftLeftLogical(UInt(1), BitwiseAnd(selectedLane, UInt(PairedHalfLaneCount - 1)));
+            var pairRuns = IsNotZero(BitwiseAnd(HalfBallot(_module.ConstantBool(true)), pairBit));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, pairRuns, value, spilled);
+        }
+
         private uint LogicalOr(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.LogicalOr, _boolType, left, right);
 

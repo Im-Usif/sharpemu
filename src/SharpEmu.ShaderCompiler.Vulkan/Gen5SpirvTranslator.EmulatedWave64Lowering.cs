@@ -32,6 +32,8 @@ public static partial class Gen5SpirvTranslator
             private readonly uint _waveStride;
             private uint _rendezvousEpoch;
             private uint _rendezvousArrivals;
+            private uint _runningLanes;
+            private uint _runningUpperLanes;
             private Ir.Gen5Wave64HalfMaskPlan? _halfMaskPlan;
             private bool _halfMaskPlanBuilt;
             private bool _synchronizeSharedMemory;
@@ -119,6 +121,12 @@ public static partial class Gen5SpirvTranslator
                 _exchangeParity = _context.DeclareFunctionUint(
                     _context._module.Constant(_context._uintType, 0));
                 _context._module.AddName(_exchangeParity, "wave64ExchangeParity");
+                if (_canBePartial)
+                {
+                    _runningLanes = _context.DeclareFunctionUint(_context.UInt(0));
+                    _runningUpperLanes = _context.DeclareFunctionUint(_context.UInt(0));
+                    _context._module.AddName(_runningLanes, "wave64RunningLanes");
+                }
                 if (_multiWave)
                 {
                     _rendezvousEpoch = _context.DeclareFunctionUint(
@@ -194,12 +202,37 @@ public static partial class Gen5SpirvTranslator
                 var lower = context.Load(context._uintType, ExchangePointer(area, context.UInt(0)));
                 var upper = context.Load(context._uintType, ExchangePointer(area, context.UInt(1)));
                 context.StoreS64(126, context.Pair64(lower, upper));
+                if (_runningLanes != 0)
+                {
+                    context.Store(_runningLanes, lower);
+                    context.Store(_runningUpperLanes, upper);
+                }
                 if (_rendezvousArrivals != 0)
                 {
                     uint Runs(uint mask) => context._module.AddInstruction(
                         SpirvOp.Select, context._uintType, context.IsNotZero(mask), context.UInt(1), context.UInt(0));
                     context.Store(_rendezvousArrivals, context.IAdd(Runs(lower), Runs(upper)));
                 }
+            }
+
+            // Whether a lane of the wave runs at all: a lane past the thread count leaves at entry.
+            public uint LaneRuns(uint lane)
+            {
+                var context = _context;
+                if (_runningLanes == 0)
+                {
+                    return context._module.ConstantBool(true);
+                }
+
+                var word = context._module.AddInstruction(
+                    SpirvOp.Select,
+                    context._uintType,
+                    context._module.AddInstruction(SpirvOp.ULessThan, context._boolType, context.BitwiseAnd(lane, context.UInt(63)), context.UInt(32)),
+                    context.Load(context._uintType, _runningLanes),
+                    context.Load(context._uintType, _runningUpperLanes));
+                return context.IsNotZero(context.BitwiseAnd(
+                    context.ShiftRightLogical(word, context.BitwiseAnd(lane, context.UInt(31))),
+                    context.UInt(1)));
             }
 
             public void BeginBlock()
