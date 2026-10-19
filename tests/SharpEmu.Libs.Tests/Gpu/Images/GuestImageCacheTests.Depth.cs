@@ -471,6 +471,48 @@ public sealed unsafe partial class GuestImageCacheTests
     }
 
     [Fact]
+    public void PartialDepthViewOfStencilTarget_KeepsTheStencilPlaneOfEveryLayer()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint layers = 6;
+        const ulong depthSlice = 16;
+        const ulong stencilSlice = 4;
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var stencilAddress = address + 0x10000;
+        var stencilBytes = new byte[stencilSlice * layers];
+        for (var index = 0; index < stencilBytes.Length; index++)
+            stencilBytes[index] = (byte)(0x10 + index);
+        harness.Write(stencilAddress, stencilBytes);
+        var layered = AsDepthTarget(LinearRequest(address, depthSlice * layers, Format.R32Sfloat, GuestPixelFormat.Bits32Float,
+            GuestImageType.Color2D, new Extent3D(4, 1, 1), layers, 4, 1), Format.D32SfloatS8Uint);
+        layered.Description.Stencil = new GuestSpan(stencilAddress, stencilSlice * layers);
+        layered.View = layered.View with { Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+        var layeredIdentifier = harness.Acquire(ref layered);
+        var owner = harness.Image(layeredIdentifier);
+
+        // A view of the first slice names one layer's depth and stencil. The cached owner keeps its six layers,
+        // and its stencil association keeps the plane of every layer.
+        var first = layered;
+        first.Description.Data = new GuestSpan(address, depthSlice);
+        first.Description.Resources = SubresourceCount.Single;
+        first.Description.MipLayout[0].Size = depthSlice;
+        first.Description.Stencil = new GuestSpan(stencilAddress, stencilSlice);
+        first.View = first.View with { Type = ImageViewType.Type2D, LayerCount = 1 };
+        Assert.Equal(layeredIdentifier, harness.Acquire(ref first));
+        Assert.Equal(layered.Description.Stencil, owner.Description.Stencil);
+        Assert.Equal(stencilBytes, harness.ReadImageBytes(owner, ImageAspectFlags.StencilBit)[..stencilBytes.Length]);
+
+        // A guest store into the plane refreshes the stencil of every layer through the view of the first slice.
+        var replacement = stencilBytes.Select(value => (byte)(value + 0x40)).ToArray();
+        harness.Write(stencilAddress, replacement);
+        Assert.True(harness.WriteFault(stencilAddress));
+        Assert.Equal(layeredIdentifier, harness.Acquire(ref first));
+        Assert.Equal(replacement, harness.ReadImageBytes(owner, ImageAspectFlags.StencilBit)[..replacement.Length]);
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void UnequalSampleDepthOverlap_RunsTheColorToDepthBlit()
     {
         if (!GatePrerequisites.Ready(_vulkan, sampleRateShading: true)) return;

@@ -521,7 +521,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         if (request.Description.HasStencil)
         {
-            image.Description.Stencil = request.Description.Stencil;
+            image.Description.Stencil = StencilPlaneOfImage(image.Description, request.Description);
             RefreshStencilPlane(imageIdentifier, image, request.Description.Metadata.StencilCompressed);
         }
 
@@ -590,6 +590,20 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             chain.MergedTailSequence = block.GpuWriteSequence;
             return;
         }
+    }
+
+    // A view of the first slices of a layered target names the stencil plane of those layers only. The image keeps
+    // its other layers, so its stencil association covers the plane of each of them, as its depth range does.
+    private static GuestSpan StencilPlaneOfImage(in ImageDescription image, in ImageDescription request)
+    {
+        var requestLayers = request.Resources.Layers;
+        var imageLayers = image.Resources.Layers;
+        if (requestLayers == 0 || imageLayers <= requestLayers || request.Stencil.Size % requestLayers != 0)
+        {
+            return request.Stencil;
+        }
+
+        return new GuestSpan(request.Stencil.Address, request.Stencil.Size / requestLayers * imageLayers);
     }
 
     private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
