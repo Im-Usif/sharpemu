@@ -36,8 +36,9 @@ public sealed partial class GuestImageCacheTests
         return request;
     }
 
-    // An image the guest has not touched for more than the removal window may be deleted by an overlapping request.
-    private static void AgeBeyondTheRemovalWindow(CacheHarness harness, ResourceSlotIdentifier imageIdentifier)
+    // An image the guest has not touched for more than the removal window, nor since the frame ended, may be deleted
+    // by an overlapping request.
+    private static void AgeBeyondTheRemovalWindow(CacheHarness harness, ResourceSlotIdentifier imageIdentifier, bool endFrame = true)
     {
         for (var pass = 0; pass < 100 && harness.Scheduler.CurrentTick <= 40; pass++)
         {
@@ -46,6 +47,10 @@ public sealed partial class GuestImageCacheTests
 
         Assert.True(harness.Scheduler.CurrentTick > 40);
         harness.Image(imageIdentifier).LastAccessTick = 0;
+        if (endFrame)
+        {
+            harness.Worker.Run(() => harness.Images.RunGarbageCollector());
+        }
     }
 
     [Theory]

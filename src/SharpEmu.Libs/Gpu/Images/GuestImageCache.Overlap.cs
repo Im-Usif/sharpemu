@@ -451,7 +451,10 @@ public sealed partial class GuestImageCache
 
         ref var cachedInfo = ref cached.Description;
         var currentTick = _scheduler.CurrentTick;
-        var safeToDelete = currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
+        // A title submits dozens of command buffers per frame, so an image it writes early in a frame and reads late
+        // in it is past the removal window in between. As in collection, an image used this frame is not stale.
+        var usedThisFrame = cached.Registered && _recencyQueue.GetLastUseTick(cached.RecencyEntryIndex) >= _collectionTick;
+        var safeToDelete = !usedThisFrame && currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
         var requestedBlock = requested.BytesPerBlock * requested.Samples;
         var cachedBlock = cachedInfo.BytesPerBlock * cachedInfo.Samples;
         var requestedBlockExtent = requested.BlockExtent;
