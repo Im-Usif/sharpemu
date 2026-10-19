@@ -855,6 +855,83 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         harness.Shutdown();
     }
 
+    // A device-address sweep stages its buffers together: on the render thread alone for a small sweep,
+    // with helper threads once it stages ParallelSweepCopyBytes, and each buffer on its own when the
+    // sweep is more than the staging ring takes at once. Each way leaves the bytes in the buffers and the
+    // tracker state that synchronizing every buffer on its own leaves.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void DeviceAddressSweepStagesItsBuffersTogether(bool large, bool overStagingLimit)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var separately = SweepAndDescribePages(_vulkan, large, overStagingLimit, sweep: false);
+        var together = SweepAndDescribePages(_vulkan, large, overStagingLimit, sweep: true);
+        Assert.Equal(separately, together);
+    }
+
+    private static (bool CpuDirty, bool GpuDirty, HostPageProtection Protection)[] SweepAndDescribePages(HeadlessVulkan vulkan,
+        bool large, bool overStagingLimit, bool sweep)
+    {
+        const int bufferCount = 24;
+        const ulong bufferBytes = 0x20000;
+        const ulong pageBytes = 0x1000;
+        using var harness = new CacheHarness(vulkan);
+        if (overStagingLimit)
+            harness.Cache.SweepStagingLimit = 1;
+        var address = harness.MapBacked(bufferCount * bufferBytes, ReadWrite);
+        var buffers = harness.Worker.Run(() => Enumerable.Range(0, bufferCount)
+            .Select(index => harness.Cache.ObtainBuffer(address + (ulong)index * bufferBytes, bufferBytes, isWritten: false))
+            .ToArray());
+        for (var round = 1; round <= 2; round++)
+        {
+            var staged = 0UL;
+            for (var index = 0; index < bufferCount; index++)
+            {
+                // A third of the buffers get one run (longer than a copy piece in a large sweep), a third
+                // two runs, and the rest nothing.
+                var start = address + (ulong)index * bufferBytes;
+                (ulong Offset, ulong Bytes)[] writes = (index % 3) switch
+                {
+                    0 => [(0x3000, large ? bufferBytes - 0x3000 : pageBytes)],
+                    1 => [(0x1000, pageBytes), (0x9000, 2 * pageBytes)],
+                    _ => [],
+                };
+                foreach (var (offset, bytes) in writes)
+                {
+                    Assert.True(harness.Store.MarkCpuWrite(start + offset, bytes));
+                    harness.Write(start + offset, Pattern((int)bytes, (byte)(round * 64 + index)));
+                    staged += bytes;
+                }
+            }
+
+            Assert.Equal(large, staged >= GuestBufferCache.ParallelSweepCopyBytes);
+            harness.Worker.Run(() =>
+            {
+                if (sweep)
+                    harness.Cache.PrepareBda([new GuestSpan(address, bufferCount * bufferBytes)]);
+                else
+                    harness.Cache.SynchronizeBuffersInRange(address, bufferCount * bufferBytes);
+            });
+            for (var index = 0; index < bufferCount; index++)
+            {
+                var (buffer, offset) = buffers[index];
+                Assert.Equal(harness.Read(address + (ulong)index * bufferBytes, (int)bufferBytes), harness.ReadBack(buffer, offset, bufferBytes));
+            }
+        }
+
+        var pages = new (bool, bool, HostPageProtection)[bufferCount * bufferBytes / pageBytes];
+        for (var page = 0; page < pages.Length; page++)
+        {
+            var at = address + (ulong)page * pageBytes;
+            pages[page] = (harness.Cache.HasCpuDirtyPages(at, pageBytes), harness.Cache.HasGpuDirtyPages(at, pageBytes), harness.Protection(at));
+        }
+
+        harness.Shutdown();
+        return pages;
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
