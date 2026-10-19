@@ -574,7 +574,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 var resource = prepared.Resources.Info.Buffers[index];
                 // Publishing a partly written image can grow a buffer past this range:
                 // every stage prepares here before any stage takes a buffer handle.
-                if (resource.Written)
+                if (resource.Written && resource.Formatted)
+                {
+                    _imageCache.PublishImagesUnderFormattedWrite(descriptor.Address, size);
+                }
+                else if (resource.Written)
                 {
                     _imageCache.PublishImagesUnderRawWrite(descriptor.Address, size);
                 }
@@ -723,7 +727,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             memoryOffset = (uint)adjustment;
-            // The images a write covers in part were published when the stage was prepared (FindBuffers).
+            // The images a raw write covers in part, and all images under a formatted write, were published
+            // when the stage was prepared (FindBuffers).
             if (resource.Written && resource.Formatted)
             {
                 _imageCache.InvalidateMemoryFromGpuAfterPublish(address, size);

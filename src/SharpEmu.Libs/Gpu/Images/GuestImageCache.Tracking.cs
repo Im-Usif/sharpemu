@@ -479,8 +479,8 @@ public sealed partial class GuestImageCache
 
     public void InvalidateMemoryFromGpu(ulong address, ulong size) => InvalidateMemoryFromGpu(address, size, publish: true);
 
-    // A formatted shader write whose partly written images were published when its stage was prepared: the
-    // images under it lose their ownership only after its buffer took the contents of an image it starts at.
+    // A formatted shader write whose images were published when its stage was prepared: the images under it
+    // lose their ownership only after its buffer took the contents of an image it starts at.
     public void InvalidateMemoryFromGpuAfterPublish(ulong address, ulong size) => InvalidateMemoryFromGpu(address, size, publish: false);
 
     private void InvalidateMemoryFromGpu(ulong address, ulong size, bool publish)
@@ -521,9 +521,10 @@ public sealed partial class GuestImageCache
     // bytes, starts from them instead of stale guest memory. Buffer bytes the GPU wrote under the image
     // before it are older than its contents: a buffer write after it over part of it published it then.
     // A raw binding over the whole image leaves it GPU-modified; its bytes may be newer than the image,
-    // so such an image is not published. The buffer is obtained outside the lock; contents that cannot
+    // so such an image is not published. A formatted write takes the ownership of the whole images under
+    // it too, which then publish as well. The buffer is obtained outside the lock; contents that cannot
     // be copied are lost as before.
-    private void PublishPartlyWrittenImages(ulong address, ulong size)
+    private void PublishPartlyWrittenImages(ulong address, ulong size, bool wholeImages = false)
     {
         List<ResourceSlotIdentifier>? partlyWritten = null;
         using (var held = _lock.Hold())
@@ -533,7 +534,7 @@ public sealed partial class GuestImageCache
                 var image = _slots[imageIdentifier];
                 var range = image.Description.Data;
                 if (image.IsGpuModified && !image.DepthOwner.IsValid && image.Overlaps(address, size) &&
-                    (address > range.Address || address + size < range.Address + range.Size) &&
+                    (wholeImages || address > range.Address || address + size < range.Address + range.Size) &&
                     image.SafeToDownload && !image.RawWriteAfterGpuWrite && !HasNewerHandedOverImage(imageIdentifier, image))
                 {
                     (partlyWritten ??= []).Add(imageIdentifier);
@@ -619,6 +620,17 @@ public sealed partial class GuestImageCache
         if (IsValidRange(address, size))
         {
             PublishPartlyWrittenImages(address, size);
+        }
+    }
+
+    // A formatted binding takes the ownership of every image under it once its buffer is obtained, while its
+    // shader may write only part of the window. The images it covers whole move their contents into the
+    // buffer first as well, so the bytes the shader leaves keep them.
+    public void PublishImagesUnderFormattedWrite(ulong address, ulong size)
+    {
+        if (IsValidRange(address, size))
+        {
+            PublishPartlyWrittenImages(address, size, wholeImages: true);
         }
     }
 
