@@ -80,4 +80,91 @@ public sealed class GuestPermissionLedgerTests
         Assert.Equal(ReadWrite, ledger.Lookup(0));
         Assert.Equal(ReadWrite, ledger.Lookup(0x10000));
     }
+
+    // Lookups take no lock while map and mprotect events change the ledger, so each one must answer
+    // from the records before or after a change. The writer splits three-page records and joins them
+    // again (their outer pages are removed and set again, always Read) and adds and removes records in
+    // the gaps between them, so the tree rebalances under the readers.
+    [Fact]
+    public void Lookup_AnswersFromWholeChangesWhileTheLedgerChanges()
+    {
+        const ulong first = 0x10_0000;
+        const ulong stride = 0x4000;
+        const int records = 64;
+        const int readerCount = 4;
+        var ledger = new GuestPermissionLedger();
+        for (var record = 0UL; record < records; record++)
+            ledger.Set(first + record * stride, 0x3000, GuestPageProtection.Read);
+
+        var started = 0;
+        var done = false;
+        var wrong = 0;
+        var readers = Enumerable.Range(0, readerCount).Select(_ => new Thread(() =>
+        {
+            Interlocked.Increment(ref started);
+            while (!Volatile.Read(ref done))
+            {
+                for (var record = 0UL; record < records; record++)
+                {
+                    var start = first + record * stride;
+                    if (ledger.Lookup(start) != GuestPageProtection.Read ||
+                        ledger.Lookup(start + 0x2FFF) != GuestPageProtection.Read ||
+                        ledger.Lookup(start + 0x1800) is not (GuestPageProtection.Read or GuestPageProtection.None) ||
+                        ledger.Lookup(start + 0x3800) is not (ReadWrite or GuestPageProtection.Execute))
+                    {
+                        Interlocked.Increment(ref wrong);
+                    }
+                }
+            }
+        })).ToArray();
+        foreach (var reader in readers)
+            reader.Start();
+
+        while (Volatile.Read(ref started) != readerCount)
+            Thread.Yield();
+        var random = new System.Random(5);
+        for (var round = 0; round < 20000; round++)
+        {
+            var start = first + (ulong)random.Next(records) * stride;
+            if ((round & 1) == 0)
+            {
+                ledger.Set(start + 0x1000, 0x1000, GuestPageProtection.None);
+                ledger.Set(start, 0x3000, GuestPageProtection.Read);
+            }
+            else
+            {
+                ledger.Set(start + 0x3000, 0x1000, GuestPageProtection.Execute);
+                ledger.Clear(start + 0x3000, 0x1000);
+            }
+        }
+
+        Volatile.Write(ref done, true);
+        foreach (var reader in readers)
+            reader.Join();
+        Assert.Equal(0, wrong);
+    }
+
+    // A snapshot keeps the records it was taken with while the tree it came from changes.
+    [Fact]
+    public void Snapshot_KeepsItsRecordsWhileTheTreeChanges()
+    {
+        var tree = new PermissionRangeTree();
+        for (var index = 0UL; index < 32; index++)
+            tree[index * 0x10] = new PermissionRange(index * 0x10, 0x8, GuestPageProtection.Read);
+        var snapshot = tree.Snapshot();
+        var before = snapshot.ToArray();
+
+        for (var index = 0UL; index < 32; index += 2)
+            tree.Remove(new PermissionRange(index * 0x10, 0x8, GuestPageProtection.Read));
+        for (var index = 32UL; index < 64; index++)
+            tree[index * 0x10] = new PermissionRange(index * 0x10, 0x8, GuestPageProtection.None);
+        tree[0x10] = new PermissionRange(0x10, 0x4, GuestPageProtection.Execute);
+
+        Assert.Equal(before, snapshot.ToArray());
+        var expected = Enumerable.Range(0, 64).Where(index => index >= 32 || index % 2 == 1)
+            .Select(index => new PermissionRange((ulong)index * 0x10, index == 1 ? 0x4UL : 0x8UL,
+                index == 1 ? GuestPageProtection.Execute : index < 32 ? GuestPageProtection.Read : GuestPageProtection.None));
+        Assert.Equal(expected, tree.ToArray());
+        Assert.Equal(new PermissionRange(0x10, 0x8, GuestPageProtection.Read), snapshot.FindAtOrBelow(0x17));
+    }
 }
