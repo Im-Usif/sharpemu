@@ -34,10 +34,22 @@ public sealed class GuestPermissionLedger
 
     // A span without a record is read-write: every caller is gated by a registered span first.
     // A lookup during a change answers from the records before it, as a locked one just before would.
-    public GuestPageProtection Lookup(ulong address) =>
-        Volatile.Read(ref _published).FindAtOrBelow(address) is { } span && span.Address + span.Size > address
-            ? span.Protection
-            : GuestPageProtection.Read | GuestPageProtection.Write;
+    public GuestPageProtection Lookup(ulong address) => Lookup(address, out _);
+
+    // validEnd is where the answer stops holding: the end of the record that holds the address, or the
+    // start of the next record in a gap. A caller walking pages upward reuses the answer below it.
+    public GuestPageProtection Lookup(ulong address, out ulong validEnd)
+    {
+        if (Volatile.Read(ref _published).FindAtOrBelow(address, out var nextAddress) is { } span &&
+            span.Address + span.Size > address)
+        {
+            validEnd = span.Address + span.Size;
+            return span.Protection;
+        }
+
+        validEnd = nextAddress;
+        return GuestPageProtection.Read | GuestPageProtection.Write;
+    }
 
     private void RemoveRangeRecords(ulong start, ulong end)
     {

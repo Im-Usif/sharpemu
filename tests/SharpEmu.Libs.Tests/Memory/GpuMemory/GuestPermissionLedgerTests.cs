@@ -34,10 +34,22 @@ public sealed class GuestPermissionLedgerTests
             Array.Fill(expected, protection, start, length);
             for (var address = 0; address < expected.Length; address++)
                 Assert.Equal(expected[address], ledger.Lookup((ulong)address));
+            // The end a lookup names never passes a change of answer.
+            var answerEnd = expected[^1] == ReadWrite ? ulong.MaxValue : (ulong)expected.Length;
+            for (var address = expected.Length - 1; address >= 0; address--)
+            {
+                if (address + 1 < expected.Length && expected[address + 1] != expected[address])
+                    answerEnd = (ulong)address + 1;
+                Assert.Equal(expected[address], ledger.Lookup((ulong)address, out var validEnd));
+                Assert.InRange(validEnd, (ulong)address + 1, answerEnd);
+            }
         }
         var before = GC.GetAllocatedBytesForCurrentThread();
         for (ulong address = 0; address < 256; address++)
+        {
             _ = ledger.Lookup(address);
+            _ = ledger.Lookup(address, out _);
+        }
         Assert.Equal(before, GC.GetAllocatedBytesForCurrentThread());
     }
 
@@ -81,10 +93,52 @@ public sealed class GuestPermissionLedgerTests
         Assert.Equal(ReadWrite, ledger.Lookup(0x10000));
     }
 
-    // Lookups take no lock while map and mprotect events change the ledger, so each one must answer
-    // from the records before or after a change. The writer splits three-page records and joins them
-    // again (their outer pages are removed and set again, always Read) and adds and removes records in
-    // the gaps between them, so the tree rebalances under the readers.
+    // A caller walking pages upward reuses one answer below the address the lookup names: the end of the
+    // record that holds the address, or the start of the next record in a gap.
+    [Fact]
+    public void Lookup_NamesWhereItsAnswerStopsHolding()
+    {
+        var ledger = new GuestPermissionLedger();
+        Assert.Equal(ReadWrite, ledger.Lookup(0x5000, out var end));
+        Assert.Equal(ulong.MaxValue, end);
+
+        ledger.Set(0x2000, 0x2000, GuestPageProtection.Read);
+        ledger.Set(0x4000, 0x0800, GuestPageProtection.Execute);
+        ledger.Set(0x6000, 0x1000, GuestPageProtection.None);
+
+        // Before the first record, at both ends of a record, where two records touch, in a gap and past
+        // the last record.
+        Assert.Equal(ReadWrite, ledger.Lookup(0, out end));
+        Assert.Equal(0x2000UL, end);
+        Assert.Equal(ReadWrite, ledger.Lookup(0x1FFF, out end));
+        Assert.Equal(0x2000UL, end);
+        Assert.Equal(GuestPageProtection.Read, ledger.Lookup(0x2000, out end));
+        Assert.Equal(0x4000UL, end);
+        Assert.Equal(GuestPageProtection.Read, ledger.Lookup(0x3FFF, out end));
+        Assert.Equal(0x4000UL, end);
+        Assert.Equal(GuestPageProtection.Execute, ledger.Lookup(0x4000, out end));
+        Assert.Equal(0x4800UL, end);
+        Assert.Equal(ReadWrite, ledger.Lookup(0x4800, out end));
+        Assert.Equal(0x6000UL, end);
+        Assert.Equal(GuestPageProtection.None, ledger.Lookup(0x6FFF, out end));
+        Assert.Equal(0x7000UL, end);
+        Assert.Equal(ReadWrite, ledger.Lookup(0x7000, out end));
+        Assert.Equal(ulong.MaxValue, end);
+
+        // A split record names the end of its own part; a cleared range is a gap up to the next record.
+        ledger.Set(0x2800, 0x0800, GuestPageProtection.None);
+        Assert.Equal(GuestPageProtection.Read, ledger.Lookup(0x2000, out end));
+        Assert.Equal(0x2800UL, end);
+        ledger.Clear(0x3000, 0x1000);
+        Assert.Equal(ReadWrite, ledger.Lookup(0x3000, out end));
+        Assert.Equal(0x4000UL, end);
+    }
+
+    // Lookups take no lock while map and mprotect events change the ledger, so each one must answer,
+    // with the end of its record, from the records before or after a change. The writer splits
+    // three-page records and joins them again (their outer pages are removed and set again, always
+    // Read) and adds and removes records in the gaps between them, so the tree rebalances under the
+    // readers.
     [Fact]
     public void Lookup_AnswersFromWholeChangesWhileTheLedgerChanges()
     {
@@ -107,10 +161,15 @@ public sealed class GuestPermissionLedgerTests
                 for (var record = 0UL; record < records; record++)
                 {
                     var start = first + record * stride;
-                    if (ledger.Lookup(start) != GuestPageProtection.Read ||
-                        ledger.Lookup(start + 0x2FFF) != GuestPageProtection.Read ||
-                        ledger.Lookup(start + 0x1800) is not (GuestPageProtection.Read or GuestPageProtection.None) ||
-                        ledger.Lookup(start + 0x3800) is not (ReadWrite or GuestPageProtection.Execute))
+                    var next = record + 1 < records ? start + stride : ulong.MaxValue;
+                    var outer = (ledger.Lookup(start, out var end), end);
+                    var middle = (ledger.Lookup(start + 0x1800, out end), end);
+                    var last = (ledger.Lookup(start + 0x2FFF, out end), end);
+                    var gap = (ledger.Lookup(start + 0x3800, out end), end);
+                    if ((outer != (GuestPageProtection.Read, start + 0x3000) && outer != (GuestPageProtection.Read, start + 0x1000)) ||
+                        (middle != (GuestPageProtection.Read, start + 0x3000) && middle != (GuestPageProtection.None, start + 0x2000)) ||
+                        last != (GuestPageProtection.Read, start + 0x3000) ||
+                        (gap != (ReadWrite, next) && gap != (GuestPageProtection.Execute, start + 0x4000)))
                     {
                         Interlocked.Increment(ref wrong);
                     }

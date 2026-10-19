@@ -41,14 +41,21 @@ internal sealed class PermissionRangeTree : IEnumerable<PermissionRange>
         }
     }
 
-    public PermissionRange? FindAtOrBelow(ulong address)
+    public PermissionRange? FindAtOrBelow(ulong address) => FindAtOrBelow(address, out _);
+
+    // nextAddress is the start of the first record above the address, or ulong.MaxValue without one.
+    public PermissionRange? FindAtOrBelow(ulong address, out ulong nextAddress)
     {
         var current = _root;
         PermissionRange? result = null;
+        nextAddress = ulong.MaxValue;
         while (current is not null)
         {
             if (current.Range.Address > address)
+            {
+                nextAddress = current.Range.Address;
                 current = current.Left;
+            }
             else
             {
                 result = current.Range;
