@@ -1204,6 +1204,9 @@ internal static unsafe partial class VulkanVideoPresenter
             public long StartTimestamp;
             public long CompileMilliseconds;
             public long CompletedTimestamp;
+
+            // A linked program's own pipeline cache (CreateLinkedPipelineCache), written once its pipeline is registered.
+            public DriverCacheShard? LinkedCache;
         }
 
         private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
@@ -1263,6 +1266,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     UsesBindlessHeap = pending.UsesBindlessHeap,
                     ProfileComputeHash = pending.Hash,
                 }, () => _pendingComputePipelines.Remove(key));
+                ReleaseLinkedPipelineCache(pending.LinkedCache, pending.Hash, save: true);
+
                 return true;
             }
 
@@ -1289,7 +1294,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var device = _device;
-            var cacheSource = GetGuestPipelineCacheSource(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
+            var linkedCache = linked ? CreateLinkedPipelineCache(description.Stage.Hash) : null;
+            var cacheSource = linkedCache?.Cache ?? GetGuestPipelineCacheSource(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
             var vk = _vk;
             var requiredSubgroupSize = ComputeRequiredSubgroupSize(description.Input);
             var started = new PendingComputePipeline
@@ -1302,6 +1308,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Hash = description.Stage.Hash,
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),
                 StartTimestamp = Stopwatch.GetTimestamp(),
+                LinkedCache = linkedCache,
             };
             started.Compile = Task.Factory.StartNew(
                 () =>
@@ -1406,6 +1413,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     Console.Error.WriteLine($"[LOADER][WARN] Pending compute pipeline failed during shutdown: {exception.Message}");
                 }
+                ReleaseLinkedPipelineCache(pending.LinkedCache, pending.Hash, save: false);
                 _vk.DestroyPipelineLayout(_device, pending.Layout, null);
                 _vk.DestroyDescriptorSetLayout(_device, pending.SetLayout, null);
             }
