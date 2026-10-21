@@ -375,6 +375,8 @@ public static partial class Gen5SpirvTranslator
                 else if (structuredForward)
                 {
                     // Keep structured control flow so the driver can promote local registers.
+                    PlanOutlinedCallBodies(blocks);
+                    BeginOutlinedCallBodies();
                     var structuredMerge = _module.AllocateId();
                     if (!TryEmitStructuredRange(blocks, 0, blocks.Count - 1, -1, out error))
                     {
@@ -461,6 +463,10 @@ public static partial class Gen5SpirvTranslator
 
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
+                if (!TryEmitOutlinedCallBodies(blocks, out error))
+                {
+                    return false;
+                }
 
                 // After every function that may call it.
                 EmitTypedElementDecoder();
@@ -663,6 +669,19 @@ public static partial class Gen5SpirvTranslator
                 _callRecordRow = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, uint.MaxValue));
                 _module.AddName(_callRecordRow, "callRecordRow");
                 _interfaces.Add(_callRecordRow);
+            }
+
+            if (_sharedCalls is not null)
+            {
+                _callSlot = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, 0));
+                _module.AddName(_callSlot, "callSlot");
+                _interfaces.Add(_callSlot);
+                if (_sharedCalls.Lookups.Count != 0)
+                {
+                    _callGroup = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, 0));
+                    _module.AddName(_callGroup, "callGroup");
+                    _interfaces.Add(_callGroup);
+                }
             }
 
             {
@@ -1642,6 +1661,7 @@ public static partial class Gen5SpirvTranslator
 
                 _execKnownFull = IsExecKnownFull(instruction.Pc);
                 _unobservedWrites = _stage == Gen5SpirvStage.Mesh ? default : ObservationPlan()?.UnobservedWrites(instruction.Pc) ?? default;
+                CombineSiteFacts(instruction.Pc);
                 var emitted = _pairedMeshLanes
                     ? TryEmitPairedInstruction(instruction, out error,
                         index + 1 < block.EndIndex && IsMeshSharedMemoryRead(instruction) &&
@@ -1729,6 +1749,16 @@ public static partial class Gen5SpirvTranslator
                     condition = LogicalNot(LogicalAnd(
                         _module.AddInstruction(SpirvOp.IEqual, _boolType, address, CallTarget(call.Address)),
                         CallArgumentMatches(argument, call.RuntimeArgument ? AnyCallArgument : call.Argument, [])));
+                    hasCondition = true;
+                }
+                else if (terminator.Control is ShaderCallGroupControl group)
+                {
+                    if (_sharedCalls is { } sites && sites.Lookups.TryGetValue(terminator.Pc, out var site))
+                    {
+                        EmitSiteLookup(site);
+                    }
+
+                    condition = _module.AddInstruction(SpirvOp.INotEqual, _boolType, Load(_uintType, _callGroup), UInt(group.Group));
                     hasCondition = true;
                 }
                 if (!hasTarget || (!hasTargetBlock && !targetExits) || !hasCondition)
@@ -2142,6 +2172,13 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             for (var index = first; index <= last;)
             {
+                if (!_emittingOutlinedBody && _outlinedBodies.TryGetValue(index, out var outlined))
+                {
+                    EmitOutlinedBodyCall(index, outlined.Function);
+                    index = outlined.Last + 1;
+                    continue;
+                }
+
                 if (index != enclosingHeader && _loopLatchByHeader.TryGetValue(index, out var latch))
                 {
                     if (!TryEmitStructuredLoop(blocks, index, latch, out error))
@@ -2310,18 +2347,34 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (instruction.Control is SharedBodyCallControl sharedCall)
+            {
+                return TryEmitSharedBodyCall(sharedCall, out error);
+            }
+
             // No shader trap handler is installed, so S_TRAP has no effect.
             if (instruction.Control is ShaderCallEntryControl call)
             {
                 var returnAddress = ProgramAddress(call.ReturnAddress);
                 StoreS(call.ReturnRegister, Narrow(returnAddress));
                 StoreS(call.ReturnRegister + 1, Narrow(ShiftRightLogical64(returnAddress, ULong(32))));
+                if (_sharedCalls is { } entries && entries.SlotByEntryPc.TryGetValue(instruction.Pc, out var slot))
+                {
+                    Store(_callSlot, UInt(slot));
+                }
+
                 if (call.RuntimeArgument)
                 {
                     EmitCallRecordLookup(call);
                 }
 
                 return true;
+            }
+
+            if (_sharedCalls is { } shared && !_emittingCallRecord && shared.TryGetRecordPcs(instruction.Pc, out var recordPcs) &&
+                _request.Memory.TryGetIndex(instruction.Pc, 0, out _))
+            {
+                return TryEmitSharedCallInstruction(instruction, recordPcs, out error);
             }
             if (instruction.Opcode == "STrap")
             {
@@ -8772,7 +8825,7 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            _execFullPcs ??= Ir.Gen5ExecFullAnalysis.Analyze(_request.Program, wave32: _waveLaneCount == 32);
+            _execFullPcs ??= Ir.Gen5ExecFullAnalysis.Analyze(AnalysisProgram, wave32: _waveLaneCount == 32);
             return _execFullPcs.Contains(pc);
         }
 
@@ -8789,7 +8842,7 @@ public static partial class Gen5SpirvTranslator
             {
                 _observationPlanBuilt = true;
                 _observationPlan = ExecSelectElimination && !_pixelExecExcludesHelpers
-                    ? Ir.Gen5VectorObservationAnalysis.Analyze(_request.Program, wave32: _waveLaneCount == 32)
+                    ? Ir.Gen5VectorObservationAnalysis.Analyze(AnalysisProgram, wave32: _waveLaneCount == 32)
                     : null;
             }
 
@@ -9138,6 +9191,7 @@ public static partial class Gen5SpirvTranslator
 
         private void EmitConditional(uint condition, Action emit)
         {
+            condition = DivergentCondition(condition);
             var activeLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
             _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
@@ -9154,6 +9208,7 @@ public static partial class Gen5SpirvTranslator
 
         private void EmitConditional(uint condition, Action whenTrue, Action whenFalse)
         {
+            condition = DivergentCondition(condition);
             var trueLabel = _module.AllocateId();
             var falseLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
@@ -9245,6 +9300,11 @@ public static partial class Gen5SpirvTranslator
                 targetPc = call.TargetPc;
                 return true;
             }
+            if (instruction.Control is ShaderCallGroupControl group)
+            {
+                targetPc = group.TargetPc;
+                return true;
+            }
             if (instruction.Control is ShaderCallFaultControl { ReturnPc: { } returnPc })
             {
                 targetPc = returnPc;
@@ -9288,6 +9348,7 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 if ((IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm" ||
+                     instruction.Control is ShaderCallEntryControl ||
                      (splitBarriers && instruction.Opcode == "SBarrier")) &&
                     index + 1 < instructions.Count)
                 {

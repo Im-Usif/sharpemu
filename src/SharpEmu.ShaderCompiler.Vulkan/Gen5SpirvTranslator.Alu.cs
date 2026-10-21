@@ -1910,8 +1910,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var m0 = LoadS(M0ScalarRegister);
-            _moveRelativeOffsets ??= Ir.Gen5MoveRelativeOffsets.Analyze(_request.Program);
-            if (_moveRelativeOffsets.TryGetValue(instruction.Pc, out var offsets))
+            if (TryGetMoveRelativeOffsets(instruction.Pc, out var offsets))
             {
                 return TryEmitBoundedMoveRelative(instruction, destination, m0, offsets, out error);
             }

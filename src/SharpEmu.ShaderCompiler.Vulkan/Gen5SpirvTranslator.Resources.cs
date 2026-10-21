@@ -94,6 +94,7 @@ public static partial class Gen5SpirvTranslator
             return false;
         }
 
+        // Slots come from the linked program before its bodies are shared, as the host's layout does.
         var callTargets = Gen5ShaderCallLinker.CallTargets(request.Program);
         if (request.Bindings.CallTargetCount != 0 && callTargets.Length != request.Bindings.CallTargetCount)
         {
@@ -108,7 +109,8 @@ public static partial class Gen5SpirvTranslator
             return false;
         }
 
-        return new CompilationContext(request, request.Bindings.CallArgumentCount != 0 ? callArguments : null,
+        request = ShareLinkedCallBodies(request, out var sharedCalls);
+        return new CompilationContext(request, sharedCalls, request.Bindings.CallArgumentCount != 0 ? callArguments : null,
                 request.Bindings.CallTargetCount != 0 ? callTargets : null)
             .TryCompile(out shader, out error, ref profile);
     }
@@ -155,10 +157,12 @@ public static partial class Gen5SpirvTranslator
             SpirvImageDim Dimension,
             IReadOnlyList<uint> Resources);
 
-        public CompilationContext(ShaderCompileRequest request, ulong[]? callArguments = null, ulong[]? callTargets = null)
+        public CompilationContext(ShaderCompileRequest request, SharedCallBodies? sharedCalls = null,
+            ulong[]? callArguments = null, ulong[]? callTargets = null)
         {
             _request = request;
             _compactMemoryAccess = Gen5ShaderCallLinker.IsLinked(request.Program);
+            _sharedCalls = sharedCalls;
             _callArgumentSlots = callArguments?.Select((argument, slot) => (argument, slot)).ToDictionary(entry => entry.argument, entry => entry.slot);
             _callTargetSlots = callTargets?.Select((address, slot) => (address, slot)).ToDictionary(entry => entry.address, entry => entry.slot);
             _hasIndirectControlFlow = request.Program.Instructions.Any(
@@ -619,10 +623,21 @@ public static partial class Gen5SpirvTranslator
         // A planned slot is inside the table the host binds, so its load skips the runtime bounds
         // check. Large shaders make hundreds of these reads, and every check costs the Metal
         // compiler time (one large pixel shader made about 376 of them).
-        private uint LoadFlattenedSlot(uint slot) =>
-            slot < _request.FlattenedTableReservedWords
+        private uint LoadFlattenedSlot(uint slot)
+        {
+            // A shared call body's record moves the slots of the instruction being emitted (TryEmitShiftedFlatInstruction).
+            if (_flatSlotShift != 0 && _shiftedFlatSlots is { } shifted && shifted.Contains(slot))
+            {
+                var index = IAdd(UInt(slot), _flatSlotShift);
+                return _shiftedFlatSlotsReserved
+                    ? Load(_uintType, BlockWordPointer(_flattenedTable, index))
+                    : LoadFlattenedWord(index);
+            }
+
+            return slot < _request.FlattenedTableReservedWords
                 ? Load(_uintType, BlockWordPointer(_flattenedTable, UInt(slot)))
                 : LoadFlattenedWord(UInt(slot));
+        }
 
         // A linked program's address relative to the shader base the host pushes, which is the program's own address.
         private uint ProgramAddress(ulong address)
