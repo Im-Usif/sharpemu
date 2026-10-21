@@ -87,7 +87,23 @@ public static partial class Gen5SpirvTranslator
         }
 
         profile.Switch(ShaderTranslationProfile.Part.ContextSetup);
-        return new CompilationContext(request).TryCompile(out shader, out error, ref profile);
+        var callArguments = Gen5ShaderCallLinker.CallEntryArguments(request.Program);
+        if (request.Bindings.CallArgumentCount != 0 && callArguments.Length != request.Bindings.CallArgumentCount)
+        {
+            error = $"the layout holds {request.Bindings.CallArgumentCount} call arguments for {callArguments.Length}";
+            return false;
+        }
+
+        var callTargets = Gen5ShaderCallLinker.CallTargets(request.Program);
+        if (request.Bindings.CallTargetCount != 0 && callTargets.Length != request.Bindings.CallTargetCount)
+        {
+            error = $"the layout holds {request.Bindings.CallTargetCount} call targets for {callTargets.Length} callees";
+            return false;
+        }
+
+        return new CompilationContext(request, request.Bindings.CallArgumentCount != 0 ? callArguments : null,
+                request.Bindings.CallTargetCount != 0 ? callTargets : null)
+            .TryCompile(out shader, out error, ref profile);
     }
 
     private sealed partial class CompilationContext
@@ -95,6 +111,7 @@ public static partial class Gen5SpirvTranslator
         private readonly ShaderCompileRequest _request;
         private readonly Dictionary<DescriptorBindingKind, LayoutImageClass> _imageClasses = [];
         private readonly Dictionary<int, uint> _indirectKeyScratch = [];
+        private readonly Dictionary<int, uint> _heapArrays = [];
         private uint _pushData;
         private uint _shaderData;
         private uint _mipStatistics;
@@ -128,9 +145,11 @@ public static partial class Gen5SpirvTranslator
             SpirvImageDim Dimension,
             IReadOnlyList<uint> Resources);
 
-        public CompilationContext(ShaderCompileRequest request)
+        public CompilationContext(ShaderCompileRequest request, ulong[]? callArguments = null, ulong[]? callTargets = null)
         {
             _request = request;
+            _callArgumentSlots = callArguments?.Select((argument, slot) => (argument, slot)).ToDictionary(entry => entry.argument, entry => entry.slot);
+            _callTargetSlots = callTargets?.Select((address, slot) => (address, slot)).ToDictionary(entry => entry.address, entry => entry.slot);
             _hasIndirectControlFlow = request.Program.Instructions.Any(
                 static instruction => instruction.Opcode is "SSetpcB64" or "SSwappcB64");
             _usesBufferAtomics = request.Program.Instructions.Any(static instruction =>
@@ -249,6 +268,12 @@ public static partial class Gen5SpirvTranslator
                         break;
                     case DescriptorBindingKind.MipStatistics:
                         _mipStatistics = DeclareWordBlock("mipStatistics", number);
+                        break;
+                    case DescriptorBindingKind.CallRecords:
+                        _callRecords = DeclareWordBlock("callRecords", number);
+                        break;
+                    case DescriptorBindingKind.CallMarks:
+                        _callMarks = DeclareWordBlock("callMarks", number);
                         break;
                     default:
                         DeclareImageClass(binding, number);
@@ -564,6 +589,18 @@ public static partial class Gen5SpirvTranslator
             slot < _request.FlattenedTableReservedWords
                 ? Load(_uintType, BlockWordPointer(_flattenedTable, UInt(slot)))
                 : LoadFlattenedWord(UInt(slot));
+
+        // A linked program's address relative to the shader base the host pushes, which is the program's own address.
+        private uint ProgramAddress(ulong address)
+        {
+            if (!_request.Bindings.UsesShaderBase)
+            {
+                return ULong(address);
+            }
+
+            var (low, high) = LoadShaderBase();
+            return IAdd64(Pair64(low, high), ULong(unchecked(address - _request.Program.Address)));
+        }
 
         // The shader base the host pushes for this draw, as two dwords.
         private (uint Low, uint High) LoadShaderBase()
@@ -1680,35 +1717,65 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var elementIndex = UInt(fixedElement?.Element ?? (uint)element);
-            var elementPointer = _module.AddInstruction(SpirvOp.AccessChain, imageClass.ElementPointer, imageClass.Variable, elementIndex);
-            var imageValue = Load(imageClass.ImageType, elementPointer);
+            // A call record's image is the element of set 1 the host resolved for the record its callee's entry found, not its
+            // null element in set 0.
+            var heapImageSlot = BindlessHeap.ImageSlot(kind.Value);
+            var fromHeap = false;
+            uint elementPointer;
+            uint imageValue;
+            if (fixedElement is null && heapImageSlot >= 0 &&
+                request.CallRecordImageByMemoryIndex.TryGetValue(memoryIndex, out var recordImage))
+            {
+                (elementPointer, imageValue) = LoadHeapElement(heapImageSlot, imageClass.ImageType, CallRecordElement(recordImage.Field));
+                fromHeap = true;
+            }
+            else
+            {
+                var elementIndex = UInt(fixedElement?.Element ?? (uint)element);
+                elementPointer = _module.AddInstruction(SpirvOp.AccessChain, imageClass.ElementPointer, imageClass.Variable, elementIndex);
+                imageValue = Load(imageClass.ImageType, elementPointer);
+            }
+
             uint objectType;
             if (UsesSampler(instruction.Opcode))
             {
-                if (_samplerArray == 0)
+                uint sampler;
+                if (fixedElement is null && request.CallRecordSamplerByMemoryIndex.TryGetValue(memoryIndex, out var recordSampler))
                 {
-                    error = "sampling without a sampler binding";
-                    return false;
+                    (_, sampler) = LoadHeapElement(recordSampler.Slot, _module.TypeSampler(), CallRecordElement(recordSampler.Field));
+                    fromHeap = true;
+                }
+                else
+                {
+                    if (_samplerArray == 0)
+                    {
+                        error = "sampling without a sampler binding";
+                        return false;
+                    }
+
+                    if (!request.Resources.SamplerByMemoryIndex.TryGetValue(memoryIndex, out var samplerIndex))
+                    {
+                        samplerIndex = entry.Sampler;
+                    }
+
+                    if (samplerIndex == MemoryAccessInfo.NoResource)
+                    {
+                        error = "sampled access has no dense sampler";
+                        return false;
+                    }
+
+                    var samplerElement = request.Bindings.Find(DescriptorBindingKind.Samplers)!.Resources.ToList()
+                        .IndexOf(info.SamplerBinding(samplerIndex));
+                    var samplerPointer = _module.AddInstruction(SpirvOp.AccessChain, _samplerPointer, _samplerArray, UInt((uint)samplerElement));
+                    sampler = Load(_samplerType, samplerPointer);
                 }
 
-                if (!request.Resources.SamplerByMemoryIndex.TryGetValue(memoryIndex, out var samplerIndex))
-                {
-                    samplerIndex = entry.Sampler;
-                }
-
-                if (samplerIndex == MemoryAccessInfo.NoResource)
-                {
-                    error = "sampled access has no dense sampler";
-                    return false;
-                }
-
-                var samplerElement = request.Bindings.Find(DescriptorBindingKind.Samplers)!.Resources.ToList()
-                    .IndexOf(info.SamplerBinding(samplerIndex));
-                var samplerPointer = _module.AddInstruction(SpirvOp.AccessChain, _samplerPointer, _samplerArray, UInt((uint)samplerElement));
-                var sampler = Load(_samplerType, samplerPointer);
                 objectType = _module.TypeSampledImage(imageClass.ImageType);
                 imageObject = _module.AddInstruction(SpirvOp.SampledImage, objectType, imageValue, sampler);
+                if (fromHeap)
+                {
+                    _module.AddDecoration(imageObject, SpirvDecoration.NonUniform);
+                }
             }
             else
             {
@@ -1734,6 +1801,176 @@ public static partial class Gen5SpirvTranslator
                 resourceIndex);
             dstSelect = imageInfo.ShaderSwizzle;
             return true;
+        }
+
+        // ---- bindless heap ----
+
+        // One runtime array of set 1, declared at its first use.
+        private uint HeapArray(int slot, uint elementType)
+        {
+            if (_heapArrays.TryGetValue(slot, out var variable))
+            {
+                return variable;
+            }
+
+            if (_heapArrays.Count == 0)
+            {
+                _module.AddCapability(SpirvCapability.RuntimeDescriptorArray);
+                _module.AddCapability(SpirvCapability.ShaderNonUniform);
+                _module.AddCapability(SpirvCapability.SampledImageArrayNonUniformIndexing);
+            }
+
+            variable = _module.AddGlobalVariable(
+                _module.TypePointer(SpirvStorageClass.UniformConstant, _module.TypeRuntimeArray(elementType)),
+                SpirvStorageClass.UniformConstant);
+            _module.AddName(variable, $"heapArray{slot}");
+            _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, BindlessHeap.DescriptorSet);
+            _module.AddDecoration(variable, SpirvDecoration.Binding, (uint)slot);
+            _interfaces.Add(variable);
+            _heapArrays[slot] = variable;
+            return variable;
+        }
+
+        // Loads one element of a set-1 array.
+        private (uint Pointer, uint Value) LoadHeapElement(int slot, uint elementType, uint index)
+        {
+            var array = HeapArray(slot, elementType);
+            var pointer = _module.AddInstruction(
+                SpirvOp.AccessChain, _module.TypePointer(SpirvStorageClass.UniformConstant, elementType), array, index);
+            _module.AddDecoration(pointer, SpirvDecoration.NonUniform);
+            var value = Load(elementType, pointer);
+            _module.AddDecoration(value, SpirvDecoration.NonUniform);
+            return (pointer, value);
+        }
+
+        // ---- call records ----
+
+        private uint _callMarks;
+
+        // A call that reaches a callee the program does not hold sets the callee's bit (CallMarks.Bit of the call's target and
+        // the caller's hash) before it returns at once, so the host can link the callees that calls reach; a plain read first
+        // keeps a marked callee from repeating the atomic.
+        private void EmitCallMark(ShaderCallFaultControl call)
+        {
+            if (_callMarks == 0)
+            {
+                return;
+            }
+
+            uint Multiply(uint value, uint factor) => _module.AddInstruction(SpirvOp.IMul, _uintType, value, UInt(factor));
+            uint Xor(uint left, uint right) => _module.AddInstruction(SpirvOp.BitwiseXor, _uintType, left, right);
+            uint XorShift(uint value, uint shift) => Xor(value, ShiftRightLogical(value, UInt(shift)));
+            var value = Xor(Xor(LoadS(call.AddressRegister), Multiply(LoadS(call.AddressRegister + 1), 0x9E3779B1u)),
+                UInt(CallMarks.Seed(_request.Hash)));
+            value = Multiply(XorShift(value, 16), 0x7FEB352Du);
+            value = Multiply(XorShift(value, 15), 0x846CA68Bu);
+            var bit = BitwiseAnd(XorShift(value, 16), UInt(CallMarks.Bits - 1));
+            var pointer = BlockWordPointer(_callMarks, ShiftRightLogical(bit, UInt(5)));
+            var mask = ShiftLeftLogical(UInt(1), BitwiseAnd(bit, UInt(31)));
+            var unmarked = _module.AddInstruction(SpirvOp.IEqual, _boolType, BitwiseAnd(Load(_uintType, pointer), mask), UInt(0));
+            EmitConditional(unmarked, () => _module.AddInstruction(SpirvOp.AtomicOr, _uintType, pointer, UInt(1), UInt(0), mask));
+        }
+
+        private uint _callRecords;
+        private uint _callRecordRow;
+
+        private uint CallRecordWord(uint index) => Load(_uintType, BlockWordPointer(_callRecords, index));
+
+        private uint _callRecordSearch;
+
+        // A run-time call entry finds its record among the dispatch's call records (searchCallRecords); the row stays in a
+        // private variable for the callee's record accesses.
+        private void EmitCallRecordLookup(ShaderCallEntryControl call)
+        {
+            if (_callRecords == 0 || _callRecordRow == 0)
+            {
+                return;
+            }
+
+            if (_callRecordSearch == 0)
+            {
+                _callRecordSearch = _module.AllocateId();
+            }
+
+            var callee = UInt(_callTargetSlots is { } slots && slots.TryGetValue(call.Callee, out var slot) ? (uint)slot : uint.MaxValue);
+            Store(_callRecordRow, _module.AddInstruction(SpirvOp.FunctionCall, _uintType, _callRecordSearch,
+                LoadS(call.ArgumentRegister), LoadS(call.ArgumentRegister + 1), callee));
+        }
+
+        // One function for every entry, after every function that calls it (BindlessHeap.CallRecordKeyWords): a branchless
+        // binary search for the first row not below (argument low, argument high, callee slot), which it returns when the row
+        // holds the key, else no row.
+        private void EmitCallRecordSearch()
+        {
+            if (_callRecordSearch == 0)
+            {
+                return;
+            }
+
+            const uint dontInline = 2;
+            var functionType = _module.TypeFunction(_uintType, _uintType, _uintType, _uintType);
+            _module.BeginFunction(_uintType, functionType, dontInline, _callRecordSearch);
+            _module.AddName(_callRecordSearch, "searchCallRecords");
+            var low = _module.AddFunctionParameter(_uintType);
+            var high = _module.AddFunctionParameter(_uintType);
+            var callee = _module.AddFunctionParameter(_uintType);
+            _module.AddLabel();
+            var count = CallRecordWord(UInt(0));
+            uint KeyWord(uint row, uint word) => CallRecordWord(IAdd(UInt(1 + word),
+                _module.AddInstruction(SpirvOp.IMul, _uintType, row, UInt(BindlessHeap.CallRecordKeyWords))));
+            uint Below(uint row)
+            {
+                var rowLow = KeyWord(row, 0);
+                var rowHigh = KeyWord(row, 1);
+                var rowCallee = KeyWord(row, 2);
+                var highBelow = _module.AddInstruction(SpirvOp.ULessThan, _boolType, rowHigh, high);
+                var highEqual = _module.AddInstruction(SpirvOp.IEqual, _boolType, rowHigh, high);
+                var lowBelow = _module.AddInstruction(SpirvOp.ULessThan, _boolType, rowLow, low);
+                var lowEqual = _module.AddInstruction(SpirvOp.IEqual, _boolType, rowLow, low);
+                var calleeBelow = _module.AddInstruction(SpirvOp.ULessThan, _boolType, rowCallee, callee);
+                return LogicalOr(highBelow, LogicalAnd(highEqual, LogicalOr(lowBelow, LogicalAnd(lowEqual, calleeBelow))));
+            }
+
+            var position = UInt(0);
+            for (var step = (BindlessHeap.CallRecordMaximumRows + 1) >> 1; step != 0; step >>= 1)
+            {
+                var probe = IAdd(position, UInt(step));
+                var inRange = _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, probe, count);
+                var row = _module.AddInstruction(SpirvOp.Select, _uintType, inRange,
+                    _module.AddInstruction(SpirvOp.ISub, _uintType, probe, UInt(1)), UInt(0));
+                position = _module.AddInstruction(SpirvOp.Select, _uintType, LogicalAnd(inRange, Below(row)), probe, position);
+            }
+
+            var found = _module.AddInstruction(SpirvOp.ULessThan, _boolType, position, count);
+            var safe = _module.AddInstruction(SpirvOp.Select, _uintType, found, position, UInt(0));
+            var equal = LogicalAnd(found, LogicalAnd(
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, KeyWord(safe, 0), low),
+                LogicalAnd(_module.AddInstruction(SpirvOp.IEqual, _boolType, KeyWord(safe, 1), high),
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, KeyWord(safe, 2), callee))));
+            _module.AddStatement(SpirvOp.ReturnValue, _module.AddInstruction(SpirvOp.Select, _uintType, equal, position, UInt(uint.MaxValue)));
+            _module.EndFunction();
+        }
+
+        // The set-1 element of one field of the record the last call entry found, or the null element; every word it reads
+        // lies inside the buffer.
+        private uint CallRecordElement(int field)
+        {
+            if (_callRecords == 0 || _callRecordRow == 0)
+            {
+                return UInt(BindlessHeap.CallRecordNullIndex);
+            }
+
+            var words = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _callRecords, 0);
+            uint Clamped(uint index) => _module.AddInstruction(SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, index, words), index, UInt(0));
+            var row = Load(_uintType, _callRecordRow);
+            var count = CallRecordWord(UInt(0));
+            var found = _module.AddInstruction(SpirvOp.ULessThan, _boolType, row, count);
+            var safe = _module.AddInstruction(SpirvOp.Select, _uintType, found, row, UInt(0));
+            var rowsEnd = IAdd(UInt(1), _module.AddInstruction(SpirvOp.IMul, _uintType, count, UInt(BindlessHeap.CallRecordKeyWords)));
+            var first = CallRecordWord(Clamped(IAdd(rowsEnd, safe)));
+            var element = CallRecordWord(Clamped(IAdd(first, UInt((uint)field))));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, found, element, UInt(BindlessHeap.CallRecordNullIndex));
         }
 
         private const uint MipStatisticsEntries = 257;

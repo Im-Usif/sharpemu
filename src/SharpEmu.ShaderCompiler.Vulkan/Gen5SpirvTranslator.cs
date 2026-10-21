@@ -460,6 +460,9 @@ public static partial class Gen5SpirvTranslator
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
 
+                // After every function that may call it.
+                EmitCallRecordSearch();
+
                 var model = _stage switch
                 {
                     Gen5SpirvStage.Vertex => SpirvExecutionModel.Vertex,
@@ -652,6 +655,12 @@ public static partial class Gen5SpirvTranslator
             }
             _interfaces.Add(_programCounter);
             _interfaces.Add(_programActive);
+            if (_request.CallRecordImageByMemoryIndex.Count != 0 || _request.CallRecordSamplerByMemoryIndex.Count != 0)
+            {
+                _callRecordRow = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, uint.MaxValue));
+                _module.AddName(_callRecordRow, "callRecordRow");
+                _interfaces.Add(_callRecordRow);
+            }
 
             {
                 DeclareLayoutBindings();
@@ -1682,6 +1691,11 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
+                if (terminator.Control is ShaderCallFaultControl { ReturnPc: not null } returnAtOnce)
+                {
+                    EmitCallMark(returnAtOnce);
+                }
+
                 if (IsExitBranchTarget(_request.Program.Instructions, targetPc))
                 {
                     Store(_programActive, _module.ConstantBool(false));
@@ -1708,10 +1722,10 @@ public static partial class Gen5SpirvTranslator
                 if (terminator.Control is ShaderCallMatchControl call)
                 {
                     var address = Pair64(LoadS(call.AddressRegister), LoadS(call.AddressRegister + 1));
-                    var argument = Pair64(LoadS(call.ArgumentRegister), LoadS(call.ArgumentRegister + 1));
+                    var argument = (LoadS(call.ArgumentRegister), LoadS(call.ArgumentRegister + 1));
                     condition = LogicalNot(LogicalAnd(
-                        _module.AddInstruction(SpirvOp.IEqual, _boolType, address, ULong(call.Address)),
-                        _module.AddInstruction(SpirvOp.IEqual, _boolType, argument, ULong(call.Argument))));
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, address, CallTarget(call.Address)),
+                        CallArgumentMatches(argument, call.RuntimeArgument ? AnyCallArgument : call.Argument, [])));
                     hasCondition = true;
                 }
                 if (!hasTarget || (!hasTargetBlock && !targetExits) || !hasCondition)
@@ -1848,6 +1862,11 @@ public static partial class Gen5SpirvTranslator
                     {
                         error = $"unstructured s_branch at 0x{terminator.Pc:X}";
                         return false;
+                    }
+
+                    if (emit && terminator.Control is ShaderCallFaultControl { ReturnPc: not null } returnAtOnce)
+                    {
+                        EmitCallMark(returnAtOnce);
                     }
 
                     index = next;
@@ -2291,8 +2310,14 @@ public static partial class Gen5SpirvTranslator
             // No shader trap handler is installed, so S_TRAP has no effect.
             if (instruction.Control is ShaderCallEntryControl call)
             {
-                StoreS(call.ReturnRegister, UInt((uint)call.ReturnAddress));
-                StoreS(call.ReturnRegister + 1, UInt((uint)(call.ReturnAddress >> 32)));
+                var returnAddress = ProgramAddress(call.ReturnAddress);
+                StoreS(call.ReturnRegister, Narrow(returnAddress));
+                StoreS(call.ReturnRegister + 1, Narrow(ShiftRightLogical64(returnAddress, ULong(32))));
+                if (call.RuntimeArgument)
+                {
+                    EmitCallRecordLookup(call);
+                }
+
                 return true;
             }
             if (instruction.Opcode == "STrap")
@@ -8948,6 +8973,11 @@ public static partial class Gen5SpirvTranslator
             if (instruction.Control is ShaderCallMatchControl call)
             {
                 targetPc = call.TargetPc;
+                return true;
+            }
+            if (instruction.Control is ShaderCallFaultControl { ReturnPc: { } returnPc })
+            {
+                targetPc = returnPc;
                 return true;
             }
             if (instruction.Encoding != Gen5ShaderEncoding.Sopp ||

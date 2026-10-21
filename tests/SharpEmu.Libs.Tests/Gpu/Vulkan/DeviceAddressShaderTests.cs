@@ -89,6 +89,81 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         run.Finish(output, nameof(LinkedCalls_SelectTheLastRecordBeyondSixtyFourEntries));
     }
 
+    // A function reads its program address with S_GETPC_B64, above or below the caller. The module takes the callees'
+    // addresses from the dispatch: a function the game placed elsewhere than at link time is still found by the call and
+    // reads the address it now has, and the return address follows the shader base.
+    [Theory]
+    [InlineData(0x8000ul, 0x8000ul)]
+    [InlineData(0x20000ul, 0x20000ul)]
+    [InlineData(0x8000ul, 0x5_0000_0400ul)]
+    public void LinkedCalls_FunctionReadsItsOwnProgramAddress(ulong function, ulong placed)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        const ulong callerAddress = 0x10000;
+        const ulong shaderBase = 0x3_0040_0000;
+        var caller = Program(MoveScalar(0, 14, (uint)placed), MoveScalar(4, 15, (uint)(placed >> 32)), MoveScalar(8, 16, 10),
+            MoveScalar(12, 17, 0),
+            Sop1(16, "SSwappcB64", 14, Gen5Operand.Scalar(14)),
+            Vop1(20, "VMovB32", 3, Gen5Operand.Scalar(14)), Vop1(24, "VMovB32", 4, Gen5Operand.Scalar(15)),
+            BufferAccess(28, "BufferStoreDwordx4", ResultRegister, dwords: 4, vectorData: 1), EndProgram(36)) with { Address = callerAddress };
+        var body = Program(Nop(0), Sop1(4, "SGetpcB64", 2, Gen5Operand.Scalar(0)),
+            Vop1(8, "VMovB32", 1, Gen5Operand.Scalar(2)), Vop1(12, "VMovB32", 2, Gen5Operand.Scalar(3)),
+            Sop1(16, "SSetpcB64", 0, Gen5Operand.Scalar(14)));
+        var linked = Gen5ShaderCallLinker.Link(caller, [new(16, 14, 16, 14, callerAddress + 20, [new(function, 10, body)])]);
+        var run = new Run(vulkan, linked);
+        run.Dispatch(GuestBase, shaderBase: shaderBase, callTargets: [placed]);
+        Assert.Equal((uint)(placed + 8), run.ResultWord(0));
+        Assert.Equal((uint)((placed + 8) >> 32), run.ResultWord(4));
+        Assert.Equal(unchecked((uint)(shaderBase + 20)), run.ResultWord(8));
+        Assert.Equal((uint)(shaderBase >> 32), run.ResultWord(12));
+        Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
+        run.Finish(output, nameof(LinkedCalls_FunctionReadsItsOwnProgramAddress));
+    }
+
+    // A game reallocates its hit-group tables a block of records at a time. The module compares a site's argument with
+    // the arguments the dispatch pushes, so a table one of whose blocks moved keeps the module and selects by the moved
+    // arguments; a null argument stays absolute, and the block's old addresses fault.
+    [Theory]
+    [InlineData(0x2000u, 0x500010u, 0x500010u + 100)]
+    [InlineData(0x3000u, 0x900000u, 0x900000u + 200)]
+    [InlineData(0x3000u, 0u, 200u)]
+    [InlineData(0x2000u, 0x100010u, 0u)]
+    [InlineData(0x3000u, 0x500010u, 0u)]
+    public void LinkedCalls_MovedTableKeepsTheModule(uint address, uint argument, uint expected)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var caller = Program(MoveScalar(0, 14, address), MoveScalar(4, 15, 0), MoveScalar(8, 16, argument), MoveScalar(12, 17, 0),
+            Sop1(16, "SSwappcB64", 14, Gen5Operand.Scalar(14)),
+            BufferAccess(20, "BufferStoreDword", ResultRegister, vectorData: 1), EndProgram(28));
+        Gen5ShaderProgram Function(uint add) => Program(
+            Vop1(0, "VMovB32", 1, Gen5Operand.Scalar(16)),
+            Vop2(4, "VAddU32", 1, Operand(add), Gen5Operand.Vector(1)),
+            Sop1(8, "SSetpcB64", 0, Gen5Operand.Scalar(14)));
+        var first = Function(100);
+        var second = Function(200);
+        Gen5ShaderProgram Link(ulong block) => Gen5ShaderCallLinker.Link(caller, [new(16, 14, 16, 14, 20,
+            [new(0x2000, block, first), new(0x3000, 0x900000, second), new(0x2000, block + 0x10, first), new(0x3000, 0, second)])]);
+        var moved = Link(0x500000);
+        Assert.Equal(Translate(Link(0x100000)), Translate(moved));
+        var run = new Run(vulkan, moved);
+        run.Dispatch(GuestBase);
+        Assert.Equal(expected, run.ResultWord(0));
+        if (expected != 0) Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
+        else Assert.Equal(new uint[] { 2, (uint)run.Request.Hash, (uint)(run.Request.Hash >> 32),
+            16, address, 0, (uint)ShaderStage.Compute, 1 }, run.FaultWords()[^8..]);
+        run.Finish(output, nameof(LinkedCalls_MovedTableKeepsTheModule));
+    }
+
+    private static byte[] Translate(Gen5ShaderProgram program)
+    {
+        var (plan, resources, layout) = Prepare(program);
+        var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 1, ThreadCountX = 1, ScratchDwords = 32 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        return shader.Spirv;
+    }
+
     [Theory]
     [InlineData(0x10000u)]
     [InlineData(0x80000000u)]
@@ -705,6 +780,8 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         private readonly GpuBuffer _fault;
         private readonly Dictionary<ulong, GpuBuffer> _pages = [];
         private readonly ulong _tableEntries;
+        private readonly ulong[] _callArguments;
+        private readonly ulong[] _callTargets;
         private GpuBuffer? _pageTable;
 
         public Run(HeadlessVulkan vulkan, Gen5ShaderProgram program, uint threadCount = 1, ulong tableEntries = TableEntries)
@@ -719,6 +796,8 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
             _result = _runner.CreateBuffer(ResultBytes);
             _fault = _runner.CreateBuffer(tableEntries / 8 + 64);
             _tableEntries = tableEntries;
+            _callArguments = Gen5ShaderCallLinker.CallEntryArguments(program);
+            _callTargets = Gen5ShaderCallLinker.CallTargets(program);
         }
 
         public ShaderResourcePlan Plan { get; }
@@ -731,7 +810,8 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
             return bytes;
         }
 
-        public void Dispatch(ulong guestAddress, (ulong Base, ulong Size)? writtenRange = null)
+        public void Dispatch(ulong guestAddress, (ulong Base, ulong Size)? writtenRange = null, ulong shaderBase = 0,
+            ulong[]? callTargets = null)
         {
             _pageTable = _runner.CreatePageTable(_tableEntries, _pages.Select(page => (page.Key, page.Value, 0ul)));
             var registers = new uint[256];
@@ -753,7 +833,8 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
                 [DescriptorBindingKind.DeviceAddressPageTable] = [_pageTable],
                 [DescriptorBindingKind.FaultBuffer] = [_fault],
             };
-            _harness.Run(() => _runner.Dispatch(registers, bound, 1, flattenedTable: table));
+            _harness.Run(() => _runner.Dispatch(registers, bound, 1, flattenedTable: table, shaderBase: shaderBase,
+                callArguments: _callArguments, callTargets: callTargets ?? _callTargets));
         }
 
         public uint ResultWord(uint offset) => ReadWord(_runner.ReadBack(_result, 0, ResultBytes), (int)offset);
