@@ -109,6 +109,49 @@ public sealed class ShaderCallLibraryTests
         Assert.All(targets, target => Assert.Same(targets[0].Program, target.Program));
     }
 
+    // A game rebuilds its tables with the argument data at new addresses. Arguments anywhere keep the layout identity
+    // (and so the linked program) while Arguments follow them; records that stop or start sharing an argument, or a null
+    // argument that becomes one, are another layout.
+    [Fact]
+    public void LayoutIdentity_FollowsMovedArguments()
+    {
+        var caller = Program(
+            Sop2(0, "SLshlB32", 20, Gen5Operand.Scalar(20), Operand(4)),
+            ScalarBufferLoad(4, 0, 16, 4, dynamicOffsetRegister: 20),
+            Vop1(12, "VMovB32", 111, Operand(0)),
+            new(16, Gen5ShaderEncoding.Sopp, "SWaitcnt", [0xBF8C0000], [], [], null),
+            MoveScalarRegister(20, 14, 16), MoveScalarRegister(24, 15, 17),
+            MoveScalarRegister(28, 16, 18), MoveScalarRegister(32, 17, 19),
+            Sop1(36, "SSwappcB64", 14, Gen5Operand.Scalar(14)), EndProgram(40));
+        var memory = new MemoryAccessTable();
+        memory.Add(new() { Pc = 4, Kind = MemoryResourceKind.ScalarBuffer, Resource = 0 });
+        var snapshot = new ResourceSnapshot { Buffers = [[0x1000, 16u << 16, 4, 0]] };
+        ShaderCallLibrary Read(params ulong[] arguments)
+        {
+            var words = new Dictionary<ulong, uint> { [0x200000] = 0xBF800000, [0x200004] = 0xBE80200E };
+            for (var record = 0; record < arguments.Length; record++)
+            {
+                var address = 0x1000ul + (ulong)record * 16;
+                words[address] = 0x200000;
+                words[address + 4] = 0;
+                words[address + 8] = (uint)arguments[record];
+                words[address + 12] = (uint)(arguments[record] >> 32);
+            }
+
+            return ShaderCallLibrary.Read(caller, memory, snapshot, (ulong address, out uint word) => words.TryGetValue(address, out word));
+        }
+
+        var original = Read(0x5_0000_0000, 0x5_0000_0040, 0x9_0000_0000, 0);
+        Assert.Equal([0x5_0000_0000ul, 0x5_0000_0040, 0x9_0000_0000], original.Arguments);
+        var moved = Read(0x5_0010_0000, 0x5_0010_0040, 0x9_0000_0000, 0);
+        Assert.Equal(original.LayoutIdentity, moved.LayoutIdentity);
+        Assert.NotEqual(original.Identity, moved.Identity);
+        Assert.Equal([0x5_0010_0000ul, 0x5_0010_0040, 0x9_0000_0000], moved.Arguments);
+        Assert.Equal(original.LayoutIdentity, Read(0x7_0000_0000, 0x5_0000_0080, 0x1000, 0).LayoutIdentity);
+        Assert.NotEqual(original.LayoutIdentity, Read(0x5_0000_0000, 0x5_0000_0000, 0x9_0000_0000, 0).LayoutIdentity);
+        Assert.NotEqual(original.LayoutIdentity, Read(0x5_0000_0000, 0x5_0000_0040, 0x9_0000_0000, 0x9_0000_0040).LayoutIdentity);
+    }
+
     // The direct form needs only its two loads before the call: at the start of a program fewer than six instructions
     // stand before it.
     [Fact]
