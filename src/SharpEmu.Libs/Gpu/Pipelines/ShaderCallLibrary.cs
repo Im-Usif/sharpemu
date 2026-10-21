@@ -22,6 +22,10 @@ internal sealed record ShaderCallLibrary(string Identity, IReadOnlyList<ShaderCa
 {
     private const ulong MaxTableBytes = 65536;
 
+    // With runtimeArguments a site links each callee once, so a table's size sets only how many records the host reads and
+    // resolves at each dispatch.
+    private const ulong MaxRuntimeTableBytes = 1 << 20;
+
     // Read with runtimeArguments, a site's Calls hold each callee once (in the order of their code, so the program does not
     // depend on the tables' order), LayoutIdentity names only the sites and the callees' code, and Records holds every
     // record of the tables for the host to resolve at each dispatch (CallRecordSelector).
@@ -121,7 +125,7 @@ internal sealed record ShaderCallLibrary(string Identity, IReadOnlyList<ShaderCa
                 calls.Add(new(call.Pc, call.Sources[0].Value, argumentRegister, call.Destinations[0].Value, returnAddress, []));
                 continue;
             }
-            if (size > MaxTableBytes || (size & 15) != 0 || (descriptor[1] & 0x80000000) != 0)
+            if (size > (runtimeArguments ? MaxRuntimeTableBytes : MaxTableBytes) || (size & 15) != 0 || (descriptor[1] & 0x80000000) != 0)
                 throw new InvalidOperationException(
                     $"The shader call table extent or layout is not supported: address=0x{address:X} stride={stride} records={descriptor[2]} " +
                     $"swizzle={descriptor[1] >> 31} dynamic={loadControl.DynamicOffsetRegister.HasValue} offset={loadControl.ImmediateOffsetBytes}.");
