@@ -24,6 +24,10 @@ public enum DescriptorBindingKind : uint
     // Only programs linked with run-time call records bind these; they are numbered past both stages' bindings, so theirs stay.
     CallRecords = 2 * Count,
     CallMarks,
+
+    // Only programs with shader calls bind this: the readable address their branchless device-address loads read for an
+    // access they do not make.
+    DeviceAddressFallback,
 }
 
 // Thirty-two dwords of push data shared by the stages of one pipeline.
@@ -713,6 +717,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         if (info.UsesCallRecords)
         {
             descriptors.Add(new DescriptorBinding(DescriptorBindingKind.CallRecords, []));
+        }
+
+        if (info.UsesDeviceAddressFallback)
+        {
+            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.DeviceAddressFallback, []));
         }
 
         if (info.UsesCallMarks)

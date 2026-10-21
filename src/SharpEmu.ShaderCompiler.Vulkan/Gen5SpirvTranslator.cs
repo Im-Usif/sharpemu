@@ -347,6 +347,7 @@ public static partial class Gen5SpirvTranslator
                 }
                 profile.Switch(ShaderTranslationProfile.Part.InitialState);
                 InitializeStorageBlockLengths();
+                InitializeDeviceAddressFallback();
                 EmitInitialState();
                 profile.Switch(ShaderTranslationProfile.Part.Emission);
                 if (_directMeshBlocks)
@@ -388,6 +389,7 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
                 profile.Switch(ShaderTranslationProfile.Part.Finalization);
+                FlushDeviceAddressFault();
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
@@ -461,6 +463,7 @@ public static partial class Gen5SpirvTranslator
                 _module.EndFunction();
 
                 // After every function that may call it.
+                EmitTypedElementDecoder();
                 EmitCallRecordSearch();
 
                 var model = _stage switch
@@ -4072,6 +4075,17 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode.StartsWith("BufferLoadDword", StringComparison.Ordinal))
             {
+                if (_compactMemoryAccess)
+                {
+                    var words = LoadDeviceBufferWords(baseAddress, size, byteAddress, (int)control.DwordCount);
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        StoreV(control.VectorData + index, words[index]);
+                    }
+
+                    return true;
+                }
+
                 for (uint index = 0; index < control.DwordCount; index++)
                 {
                     var componentAddress = index == 0
@@ -4209,6 +4223,17 @@ public static partial class Gen5SpirvTranslator
             uint componentCount,
             Action<uint, uint>? store = null)
         {
+            if (_compactMemoryAccess)
+            {
+                var compact = CompactDeviceBufferFormatLoadValues(baseAddress, size, byteAddress, descriptorWord3, componentCount);
+                for (uint destination = 0; destination < componentCount; destination++)
+                {
+                    store?.Invoke(destination, compact[destination]);
+                }
+
+                return compact;
+            }
+
             var unifiedFormat = BitwiseAnd(
                 ShiftRightLogical(descriptorWord3, UInt(12)),
                 UInt(0x7F));
@@ -4325,6 +4350,251 @@ public static partial class Gen5SpirvTranslator
                 valid,
                 converted,
                 component == 3 ? Gfx10FormatOne(numberFormat) : UInt(0));
+        }
+
+        // A compact program's formatted device-buffer load: the element's dwords are read once, as one range.
+        private uint[] CompactDeviceBufferFormatLoadValues(
+            uint baseAddress,
+            uint size,
+            uint byteAddress,
+            uint descriptorWord3,
+            uint componentCount)
+        {
+            var unifiedFormat = BitwiseAnd(
+                ShiftRightLogical(descriptorWord3, UInt(12)),
+                UInt(0x7F));
+            var (dataFormat, _) = DecodeGfx10BufferFormat(unifiedFormat);
+
+            // Every component of every format lies in the 16 bytes from the element's first byte, so the element's
+            // first five dwords hold all of them. They are read once, each with its own bounds check; a dword past
+            // the element's last byte is not read.
+            var elementBytes = ShiftRightLogical(LoadGfx10ComponentLayout(dataFormat, UInt(0)), UInt(24));
+            var elementEnd = IAdd(BitwiseAnd(byteAddress, UInt(3)), elementBytes);
+            var needed = new uint[5];
+            for (var index = 0; index < needed.Length; index++)
+            {
+                needed[index] = _module.AddInstruction(SpirvOp.ULessThan, _boolType, UInt((uint)index * sizeof(uint)), elementEnd);
+            }
+
+            var words = LoadDeviceBufferWords(baseAddress, size, byteAddress, needed.Length, needed);
+            uint[] values;
+            if (_module.TryGetConstantValue(descriptorWord3, out _))
+            {
+                values = DecodeTypedElement(words, byteAddress, size, descriptorWord3, UInt(componentCount), (int)componentCount);
+            }
+            else
+            {
+                // A run-time V# decodes in the shared function (EmitTypedElementDecoder).
+                if (_typedElementDecoder == 0)
+                {
+                    _typedElementDecoder = _module.AllocateId();
+                }
+
+                var decoded = _module.AddInstruction(SpirvOp.FunctionCall, _uvec4Type, _typedElementDecoder,
+                    words[0], words[1], words[2], words[3], words[4], byteAddress, size, descriptorWord3, UInt(componentCount));
+                values = new uint[componentCount];
+                for (uint destination = 0; destination < componentCount; destination++)
+                {
+                    values[destination] = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, decoded, destination);
+                }
+            }
+
+            return values;
+        }
+
+        // The destinations of a typed element from its first five dwords. Each destination decodes the component its
+        // selector names (4-7); selector 1 is one and the rest zero. Only the first componentCount destinations take
+        // part in the bounds check, and the first destinations of them are returned.
+        private uint[] DecodeTypedElement(uint[] words, uint byteAddress, uint size, uint descriptorWord3, uint componentCount, int destinations)
+        {
+            var unifiedFormat = BitwiseAnd(
+                ShiftRightLogical(descriptorWord3, UInt(12)),
+                UInt(0x7F));
+            var (dataFormat, numberFormat) = DecodeGfx10BufferFormat(unifiedFormat);
+            var one = Gfx10FormatOne(numberFormat);
+            var values = new uint[destinations];
+            var constants = new uint[destinations];
+            var inBounds = _module.ConstantBool(true);
+            for (uint destination = 0; destination < destinations; destination++)
+            {
+                var selector = BitwiseAnd(
+                    ShiftRightLogical(descriptorWord3, UInt(destination * 3)),
+                    UInt(7));
+                var selectsComponent = _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, selector, UInt(4));
+                var component = LoadCompactGfx10DeviceBufferFormatComponent(
+                    size,
+                    byteAddress,
+                    words,
+                    dataFormat,
+                    numberFormat,
+                    BitwiseAnd(selector, UInt(3)),
+                    out var componentInBounds);
+                constants[destination] = SelectUInt(selector, 1, one, UInt(0));
+                values[destination] = _module.AddInstruction(SpirvOp.Select, _uintType, selectsComponent, component, constants[destination]);
+                var written = _module.AddInstruction(SpirvOp.ULessThan, _boolType, UInt(destination), componentCount);
+                inBounds = LogicalAnd(
+                    inBounds,
+                    _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                        LogicalNot(LogicalAnd(written, selectsComponent)), componentInBounds));
+            }
+
+            for (var destination = 0; destination < destinations; destination++)
+            {
+                values[destination] = _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, values[destination], constants[destination]);
+            }
+
+            return values;
+        }
+
+        private uint _typedElementDecoder;
+
+        // The run-time format decode of a typed device-buffer load as one DontInline function for every such load: the
+        // driver compiles it once. Inline, these decodes held half the selects of a large ray-tracing program.
+        private void EmitTypedElementDecoder()
+        {
+            if (_typedElementDecoder == 0)
+            {
+                return;
+            }
+
+            const uint dontInline = 2;
+            var functionType = _module.TypeFunction(_uvec4Type,
+                _uintType, _uintType, _uintType, _uintType, _uintType, _uintType, _ulongType, _uintType, _uintType);
+            _module.BeginFunction(_uvec4Type, functionType, dontInline, _typedElementDecoder);
+            _module.AddName(_typedElementDecoder, "decodeTypedElement");
+            var words = new uint[5];
+            for (var index = 0; index < words.Length; index++)
+            {
+                words[index] = _module.AddFunctionParameter(_uintType);
+            }
+
+            var byteAddress = _module.AddFunctionParameter(_uintType);
+            var size = _module.AddFunctionParameter(_ulongType);
+            var descriptorWord3 = _module.AddFunctionParameter(_uintType);
+            var componentCount = _module.AddFunctionParameter(_uintType);
+            _module.AddLabel();
+            var values = DecodeTypedElement(words, byteAddress, size, descriptorWord3, componentCount, 4);
+            _module.AddStatement(SpirvOp.ReturnValue, _module.AddInstruction(SpirvOp.CompositeConstruct, _uvec4Type, values));
+            _module.EndFunction();
+        }
+
+        // One component (a run-time index 0-3) of a typed element, picked out of the element's dwords.
+        private uint LoadCompactGfx10DeviceBufferFormatComponent(
+            uint size,
+            uint elementAddress,
+            uint[] words,
+            uint dataFormat,
+            uint numberFormat,
+            uint component,
+            out uint componentInBounds)
+        {
+            var layout = LoadGfx10ComponentLayout(dataFormat, component);
+            var byteOffset = BitwiseAnd(layout, UInt(0xFF));
+            var bitOffset = BitwiseAnd(ShiftRightLogical(layout, UInt(8)), UInt(0xFF));
+            var bitCount = BitwiseAnd(ShiftRightLogical(layout, UInt(16)), UInt(0xFF));
+            var componentAddress = IAdd(elementAddress, byteOffset);
+            var componentBytes = ShiftRightLogical(IAdd(IAdd(bitOffset, bitCount), UInt(7)), UInt(3));
+            var lastByteOffset = _module.AddInstruction(SpirvOp.ISub, _uintType, componentBytes, UInt(1));
+            var hasComponent = _module.AddInstruction(SpirvOp.INotEqual, _boolType, bitCount, UInt(0));
+            var inRange = IsDeviceBufferElementInRange(size, componentAddress, lastByteOffset);
+            componentInBounds = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                LogicalNot(hasComponent),
+                inRange);
+
+            // The four bytes from the component's first byte; a component outside the buffer reads zero.
+            var start = IAdd(BitwiseAnd(elementAddress, UInt(3)), byteOffset);
+            var first = ShiftRightLogical(start, UInt(2));
+            var shift = ShiftLeftLogical(BitwiseAnd(start, UInt(3)), UInt(3));
+            var low = SelectWord(words, first);
+            var high = SelectWord(words, IAdd(first, UInt(1)));
+            var packed = BitwiseOr(
+                ShiftRightLogical(low, shift),
+                _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, shift, UInt(0)),
+                    UInt(0),
+                    ShiftLeftLogical(high, _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(32), shift))));
+            packed = _module.AddInstruction(SpirvOp.Select, _uintType, LogicalAnd(hasComponent, inRange), packed, UInt(0));
+
+            var raw = _module.AddInstruction(SpirvOp.BitFieldUExtract, _uintType, packed, bitOffset, bitCount);
+            var converted = ConvertGfx10BufferComponent(raw, bitCount, numberFormat, dataFormat);
+            var absent = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, component, UInt(3)),
+                Gfx10FormatOne(numberFormat),
+                UInt(0));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, hasComponent, converted, absent);
+        }
+
+        // The word at a run-time index of a short array.
+        private uint SelectWord(uint[] words, uint index)
+        {
+            var value = words[0];
+            for (var candidate = 1; candidate < words.Length; candidate++)
+            {
+                value = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, index, UInt((uint)candidate)),
+                    words[candidate],
+                    value);
+            }
+
+            return value;
+        }
+
+        private uint _gfx10ComponentLayoutTable;
+
+        // A component's byteOffset | bitOffset << 8 | bitCount << 16, with its format's element size << 24, for the
+        // 16 legacy data formats (zero past them), from Gfx10UnifiedFormat.ComponentLayouts. A run-time format reads
+        // a module-level table, as DecodeGfx10BufferFormat does; a known one folds to a constant.
+        private uint LoadGfx10ComponentLayout(uint dataFormat, uint component)
+        {
+            const uint formats = 16;
+            if (_module.TryGetConstantValue(dataFormat, out var knownFormat) &&
+                _module.TryGetConstantValue(component, out var knownComponent))
+            {
+                return UInt(knownFormat < formats ? Gfx10ComponentLayoutWord(knownFormat, knownComponent & 3) : 0);
+            }
+
+            if (_gfx10ComponentLayoutTable == 0)
+            {
+                var entries = new uint[formats * 4];
+                for (uint format = 0; format < formats; format++)
+                {
+                    for (uint part = 0; part < 4; part++)
+                    {
+                        entries[format * 4 + part] = UInt(Gfx10ComponentLayoutWord(format, part));
+                    }
+                }
+
+                var tableType = _module.TypeArray(_uintType, formats * 4);
+                _gfx10ComponentLayoutTable = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, tableType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantComposite(tableType, entries));
+                _module.AddName(_gfx10ComponentLayoutTable, "gfx10ComponentLayouts");
+                _interfaces.Add(_gfx10ComponentLayoutTable);
+            }
+
+            var known = _module.AddInstruction(SpirvOp.ULessThan, _boolType, dataFormat, UInt(formats));
+            var index = IAdd(
+                ShiftLeftLogical(_module.AddInstruction(SpirvOp.Select, _uintType, known, dataFormat, UInt(0)), UInt(2)),
+                BitwiseAnd(component, UInt(3)));
+            var entry = Load(_uintType, _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, _gfx10ComponentLayoutTable, index));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, known, entry, UInt(0));
+        }
+
+        private static uint Gfx10ComponentLayoutWord(uint dataFormat, uint component)
+        {
+            var elementBytes = Gfx10UnifiedFormat.GetAccessByteSize(dataFormat, 4);
+            return Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out var bitOffset, out var bitCount)
+                ? byteOffset | bitOffset << 8 | bitCount << 16 | elementBytes << 24
+                : elementBytes << 24;
         }
 
         private void EmitBufferFormatLoad(

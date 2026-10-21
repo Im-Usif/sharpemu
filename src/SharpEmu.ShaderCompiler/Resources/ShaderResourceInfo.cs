@@ -193,6 +193,8 @@ public sealed class ShaderResourceInfo
     // A call that reaches a callee the program does not hold marks it (CallMarks).
     public bool UsesCallMarks { get; set; }
 
+    // The program has shader calls and reads device addresses: it binds DescriptorBindingKind.DeviceAddressFallback.
+    public bool UsesDeviceAddressFallback { get; set; }
 
     public ShaderResourceInfo Clone() => new()
     {
@@ -213,6 +215,7 @@ public sealed class ShaderResourceInfo
         UsesBindlessHeap = UsesBindlessHeap,
         UsesCallRecords = UsesCallRecords,
         UsesCallMarks = UsesCallMarks,
+        UsesDeviceAddressFallback = UsesDeviceAddressFallback,
     };
 }
 

@@ -304,6 +304,12 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             {
                 buffers = [CreateBuffer(MemoryMarshal.AsBytes<uint>(shaderData))];
             }
+            else if (descriptor.Kind == DescriptorBindingKind.DeviceAddressFallback && !boundBuffers.ContainsKey(descriptor.Kind))
+            {
+                // As the buffer cache does: the address of a readable buffer.
+                ulong[] fallback = [CreateBuffer(256).DeviceAddress, 0];
+                buffers = [CreateBuffer(MemoryMarshal.AsBytes<ulong>(fallback))];
+            }
             else if (!boundBuffers.TryGetValue(descriptor.Kind, out buffers!))
             {
                 buffers = [CreateBuffer(16)];

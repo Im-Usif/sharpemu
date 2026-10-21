@@ -1166,6 +1166,12 @@ internal static unsafe partial class VulkanVideoPresenter
                                 case DescriptorBindingKind.MipStatistics:
                                     bufferInfos[bufferIndex++] = MipStatisticsDescriptor();
                                     break;
+                                case DescriptorBindingKind.DeviceAddressFallback:
+                                {
+                                    var fallback = _bufferCache.DeviceAddressFallbackBuffer;
+                                    bufferInfos[bufferIndex++] = new DescriptorBufferInfo { Buffer = fallback.Handle, Offset = 0, Range = fallback.Size };
+                                    break;
+                                }
                                 case DescriptorBindingKind.DeviceAddressPageTable:
                                 case DescriptorBindingKind.FaultBuffer:
                                 {

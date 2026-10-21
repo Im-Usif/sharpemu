@@ -180,4 +180,8 @@ public static class Gen5ShaderCallLinker
     public static ulong[] CallEntryArguments(Gen5ShaderProgram program) =>
         [.. program.Instructions.Select(instruction => instruction.Control).OfType<ShaderCallEntryControl>()
             .Select(entry => entry.Argument).Where(argument => argument != 0).Distinct()];
+
+    // Whether a program was linked with its shader calls: every site of a linked program holds call entries or a fault.
+    public static bool IsLinked(Gen5ShaderProgram program) =>
+        program.Instructions.Any(static instruction => instruction.Control is ShaderCallEntryControl or ShaderCallFaultControl);
 }

@@ -101,6 +101,13 @@ public static partial class Gen5SpirvTranslator
             return false;
         }
 
+        if (Gen5ShaderCallLinker.IsLinked(request.Program) && request.Bindings.Find(DescriptorBindingKind.DeviceAddressPageTable) is not null &&
+            request.Bindings.Find(DescriptorBindingKind.DeviceAddressFallback) is null)
+        {
+            error = "the layout of a program with shader calls holds no device address fallback";
+            return false;
+        }
+
         return new CompilationContext(request, request.Bindings.CallArgumentCount != 0 ? callArguments : null,
                 request.Bindings.CallTargetCount != 0 ? callTargets : null)
             .TryCompile(out shader, out error, ref profile);
@@ -109,6 +116,9 @@ public static partial class Gen5SpirvTranslator
     private sealed partial class CompilationContext
     {
         private readonly ShaderCompileRequest _request;
+        // A program with shader calls reads device addresses and scratch without branches (ResolveCompactDeviceAddress): the
+        // driver compiled the conditional forms several times slower in large linked modules. Every other program keeps them.
+        private readonly bool _compactMemoryAccess;
         private readonly Dictionary<DescriptorBindingKind, LayoutImageClass> _imageClasses = [];
         private readonly Dictionary<int, uint> _indirectKeyScratch = [];
         private readonly Dictionary<int, uint> _heapArrays = [];
@@ -148,6 +158,7 @@ public static partial class Gen5SpirvTranslator
         public CompilationContext(ShaderCompileRequest request, ulong[]? callArguments = null, ulong[]? callTargets = null)
         {
             _request = request;
+            _compactMemoryAccess = Gen5ShaderCallLinker.IsLinked(request.Program);
             _callArgumentSlots = callArguments?.Select((argument, slot) => (argument, slot)).ToDictionary(entry => entry.argument, entry => entry.slot);
             _callTargetSlots = callTargets?.Select((address, slot) => (address, slot)).ToDictionary(entry => entry.address, entry => entry.slot);
             _hasIndirectControlFlow = request.Program.Instructions.Any(
@@ -275,6 +286,9 @@ public static partial class Gen5SpirvTranslator
                     case DescriptorBindingKind.CallMarks:
                         _callMarks = DeclareWordBlock("callMarks", number);
                         break;
+                    case DescriptorBindingKind.DeviceAddressFallback:
+                        _deviceAddressFallback = DeclareWordBlock("deviceAddressFallback", number);
+                        break;
                     default:
                         DeclareImageClass(binding, number);
                         break;
@@ -319,6 +333,12 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_deviceWordScratch, "deviceAddressWord");
                 _interfaces.Add(_deviceEntryScratch);
                 _interfaces.Add(_deviceWordScratch);
+                if (_compactMemoryAccess && !request.TraceDeviceAddressFaults)
+                {
+                    _deviceAddressFaultPage = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(uint.MaxValue));
+                    _module.AddName(_deviceAddressFaultPage, "deviceAddressFaultPage");
+                    _interfaces.Add(_deviceAddressFaultPage);
+                }
                 if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor))
                 {
                     _deviceBufferWordScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
@@ -573,6 +593,20 @@ public static partial class Gen5SpirvTranslator
                 _flattenedTableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _flattenedTable, 0);
         }
 
+        // A compact program's fallback address (ResolveCompactDeviceAddress): a readable address the host binds
+        // (DescriptorBindingKind.DeviceAddressFallback), read once.
+        private uint _deviceAddressFallback;
+        private uint _deviceFallbackPointer;
+
+        private void InitializeDeviceAddressFallback()
+        {
+            if (_compactMemoryAccess && _pageTable != 0)
+            {
+                _deviceFallbackPointer = Pair64(Load(_uintType, BlockWordPointer(_deviceAddressFallback, UInt(0))),
+                    Load(_uintType, BlockWordPointer(_deviceAddressFallback, UInt(1))));
+            }
+        }
+
         private uint StorageBlockLength(uint block)
         {
             if (block == _shaderData && _shaderDataLength != 0) return _shaderDataLength;
@@ -668,6 +702,11 @@ public static partial class Gen5SpirvTranslator
 
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
+            if (_compactMemoryAccess)
+            {
+                return ResolveCompactDeviceAddress(address64);
+            }
+
             var masked = And64(address64, ULong(DeviceAddressMask));
             var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPageBits));
             var tableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0);
@@ -708,17 +747,110 @@ public static partial class Gen5SpirvTranslator
             return (pointer, mapped);
         }
 
+        // ResolveDeviceAddress without a branch, for a compact program. An address past the table reads entry 0 and drops it;
+        // page 0, the null page, never maps, so a load that is not made reads the host's fallback address instead
+        // (LoadMappedDeviceDword). reportFault, when given, limits the fault to an access that is made.
+        private (uint Pointer, uint Valid) ResolveCompactDeviceAddress(uint address64, uint reportFault = 0)
+        {
+            var masked = And64(address64, ULong(DeviceAddressMask));
+            var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPageBits));
+            var tableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0);
+            var inTable = ULessThan64(pageIndex64, Widen(tableLength));
+            var pageIndex = Narrow(pageIndex64);
+            var entry = Load(_ulongType, _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0),
+                _module.AddInstruction(SpirvOp.Select, _uintType, inTable, pageIndex, UInt(0))));
+            var mapped = LogicalAnd(
+                LogicalAnd(inTable, _module.AddInstruction(SpirvOp.INotEqual, _boolType, pageIndex, UInt(0))),
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, entry, ULong(0)));
+            var missing = LogicalAnd(inTable, LogicalNot(mapped));
+            if (reportFault != 0)
+            {
+                missing = LogicalAnd(missing, reportFault);
+            }
+
+            if (!_request.TraceDeviceAddressFaults)
+            {
+                // The invocation keeps its last missing page and reports it when it ends (FlushDeviceAddressFault):
+                // an atomic at every load site made large shaders compile several times slower.
+                Store(_deviceAddressFaultPage,
+                    _module.AddInstruction(SpirvOp.Select, _uintType, missing, pageIndex, Load(_uintType, _deviceAddressFaultPage)));
+                return (IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1))), mapped);
+            }
+
+            EmitConditional(missing, () =>
+            {
+                {
+                    var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
+                    var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(16));
+                    var claim = _module.AddInstruction(SpirvOp.AtomicCompareExchange, _uintType,
+                        BlockWordPointer(_faultBuffer, recordStart), UInt(1), UInt(0), UInt(0), UInt(1), UInt(0));
+                    EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
+                    {
+                        uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)),
+                            UInt(_deviceAddressInstructionPc), Narrow(address64),
+                            Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, address64, ULong(32))),
+                            UInt((uint)_request.Stage), UInt(0)];
+                        for (var index = 0; index < values.Length; index++)
+                            Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
+                    });
+                }
+                var word = ShiftRightLogical(pageIndex, UInt(5));
+                var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
+                EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
+                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
+            });
+            var pointer = IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1)));
+            return (pointer, mapped);
+        }
+
+        private uint _deviceAddressFaultPage;
+
+        private void FlushDeviceAddressFault()
+        {
+            if (_deviceAddressFaultPage == 0)
+            {
+                return;
+            }
+
+            var page = Load(_uintType, _deviceAddressFaultPage);
+            var word = ShiftRightLogical(page, UInt(5));
+            EmitConditional(
+                LogicalAnd(_module.AddInstruction(SpirvOp.INotEqual, _boolType, page, UInt(uint.MaxValue)), IsBlockWordInRange(_faultBuffer, word)),
+                () => _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0),
+                    ShiftLeftLogical(UInt(1), BitwiseAnd(page, UInt(31)))));
+        }
+
         private uint DeviceWordPointer(uint pointerValue) =>
             _module.AddInstruction(SpirvOp.ConvertUToPtr, _physicalUintPointer, pointerValue);
+
+        // A load that is not made reads the fallback address and drops the value, so it needs no branch.
+        private uint LoadMappedDeviceDword(uint pointer, uint valid)
+        {
+            var safe = _module.AddInstruction(SpirvOp.Select, _ulongType, valid, pointer, _deviceFallbackPointer);
+            var word = _module.AddInstruction(SpirvOp.Load, _uintType, DeviceWordPointer(safe), 2u, 4u);
+            return _module.AddInstruction(SpirvOp.Select, _uintType, valid, word, UInt(0));
+        }
 
         // Loads one aligned dword through a device address; an unmapped page reads zero.
         private uint LoadDeviceDword(uint address64)
         {
             var (pointer, valid) = ResolveDeviceAddress(address64);
+            if (_compactMemoryAccess)
+            {
+                return LoadMappedDeviceDword(pointer, valid);
+            }
+
             Store(_deviceWordScratch, UInt(0));
             EmitConditional(valid, () =>
                 Store(_deviceWordScratch, _module.AddInstruction(SpirvOp.Load, _uintType, DeviceWordPointer(pointer), 2u, 4u)));
             return Load(_uintType, _deviceWordScratch);
+        }
+
+        // As above when allowed, in a compact program; otherwise the dword reads zero and reports no fault.
+        private uint LoadDeviceDword(uint address64, uint allowed)
+        {
+            var (pointer, valid) = ResolveCompactDeviceAddress(address64, allowed);
+            return LoadMappedDeviceDword(pointer, LogicalAnd(allowed, valid));
         }
 
         private void StoreDeviceDword(uint address64, uint value, uint allowed)
@@ -758,13 +890,21 @@ public static partial class Gen5SpirvTranslator
             var shift = ShiftLeftLogical(alignment, UInt(3));
             var low = LoadDeviceDword(aligned);
             var crosses = _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, IAdd(alignment, UInt(byteCount)), UInt(4));
-            Store(_deviceWordScratch, UInt(0));
-            EmitConditional(crosses, () =>
+            uint highWord;
+            if (_compactMemoryAccess)
             {
-                var high = LoadDeviceDword(IAdd64(aligned, ULong(4)));
-                Store(_deviceWordScratch, high);
-            });
-            var highWord = Load(_uintType, _deviceWordScratch);
+                highWord = LoadDeviceDword(IAdd64(aligned, ULong(4)), crosses);
+            }
+            else
+            {
+                Store(_deviceWordScratch, UInt(0));
+                EmitConditional(crosses, () =>
+                {
+                    var high = LoadDeviceDword(IAdd64(aligned, ULong(4)));
+                    Store(_deviceWordScratch, high);
+                });
+                highWord = Load(_uintType, _deviceWordScratch);
+            }
             var carry = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -878,9 +1018,82 @@ public static partial class Gen5SpirvTranslator
             var address = And64(
                 IAdd64(baseAddress, Widen(alignedOffset)),
                 ULong(DeviceAddressMask & ~3ul));
+            if (_compactMemoryAccess)
+            {
+                return LoadDeviceDword(address, inRange);
+            }
+
             Store(_deviceBufferWordScratch, UInt(0));
             EmitConditional(inRange, () => Store(_deviceBufferWordScratch, LoadDeviceDword(address)));
             return Load(_uintType, _deviceBufferWordScratch);
+        }
+
+        // Consecutive dwords of one buffer element or scalar load in a compact program, each with its own bounds check; a
+        // refused dword reads zero.
+        private uint[] LoadDeviceBufferWords(uint baseAddress, uint size64, uint byteOffset, int count, IReadOnlyList<uint>? allowed = null)
+        {
+            var alignedOffset = BitwiseAnd(byteOffset, UInt(~3u));
+            var address = And64(
+                IAdd64(baseAddress, Widen(alignedOffset)),
+                ULong(DeviceAddressMask & ~3ul));
+            var inRange = new uint[count];
+            for (var index = 0; index < count; index++)
+            {
+                var dwordOffset = index == 0 ? alignedOffset : IAdd(alignedOffset, UInt((uint)index * sizeof(uint)));
+                var fits = IsDeviceBufferByteRangeInRange(size64, dwordOffset, sizeof(uint));
+                inRange[index] = allowed is null ? fits : LogicalAnd(allowed[index], fits);
+            }
+
+            return LoadDeviceDwordRange(address, inRange);
+        }
+
+        // Consecutive aligned dwords through the page table, in a compact program. A range of at most 16 dwords lies in one
+        // page or straddles two, so it resolves its first and last dword only; a dword that is not allowed reads zero and
+        // reports no fault.
+        private uint[] LoadDeviceDwordRange(uint address64, IReadOnlyList<uint> allowed)
+        {
+            var count = allowed.Count;
+            if (count is < 1 or > 16)
+            {
+                throw new ArgumentOutOfRangeException(nameof(allowed), "a device dword range holds 1 to 16 dwords");
+            }
+
+            if (count == 1)
+            {
+                return [LoadDeviceDword(address64, allowed[0])];
+            }
+
+            // The page offset of the first dword decides which dwords lie in its page.
+            var pageOffset = Narrow(And64(address64, ULong(DeviceAddressPageSize - 1)));
+            var firstPage = new uint[count];
+            var firstAllowed = allowed[0];
+            var lastAllowed = _module.ConstantBool(false);
+            firstPage[0] = _module.ConstantBool(true);
+            for (var index = 1; index < count; index++)
+            {
+                firstPage[index] = _module.AddInstruction(SpirvOp.ULessThan, _boolType,
+                    IAdd(pageOffset, UInt((uint)index * sizeof(uint))), UInt((uint)DeviceAddressPageSize));
+                firstAllowed = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, firstAllowed, LogicalAnd(allowed[index], firstPage[index]));
+                lastAllowed = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, lastAllowed, LogicalAnd(allowed[index], LogicalNot(firstPage[index])));
+            }
+
+            var (firstPointer, firstMapped) = ResolveCompactDeviceAddress(address64, firstAllowed);
+            var (lastPointer, lastMapped) = ResolveCompactDeviceAddress(IAdd64(address64, ULong((ulong)(count - 1) * sizeof(uint))), lastAllowed);
+            var values = new uint[count];
+            for (var index = 0; index < count; index++)
+            {
+                var pointer = index == 0
+                    ? firstPointer
+                    : _module.AddInstruction(SpirvOp.Select, _ulongType, firstPage[index],
+                        IAdd64(firstPointer, ULong((ulong)index * sizeof(uint))),
+                        ISub64(lastPointer, ULong((ulong)(count - 1 - index) * sizeof(uint))));
+                var mapped = index == 0
+                    ? firstMapped
+                    : _module.AddInstruction(SpirvOp.Select, _boolType, firstPage[index], firstMapped, lastMapped);
+                values[index] = LoadMappedDeviceDword(pointer, LogicalAnd(allowed[index], mapped));
+            }
+
+            return values;
         }
 
         private void StoreDeviceBufferWord(uint baseAddress, uint size64, uint byteOffset, uint value)
@@ -905,6 +1118,11 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             var request = _request;
             var dynamicOffset = control.DynamicOffsetRegister is { } register ? LoadS(register) : UInt(0);
+            if (_compactMemoryAccess && TryEmitScalarDeviceRange(instruction, control, dynamicOffset))
+            {
+                return true;
+            }
+
             uint? deviceAddress = null;
             for (var component = 0; component < instruction.Destinations.Count; component++)
             {
@@ -1018,6 +1236,98 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 StoreS(destination.Value, value);
+            }
+
+            return true;
+        }
+
+        // A compact program's multi-dword scalar load whose every dword goes through the same device path reads them as one
+        // range: the descriptor is decoded once and the page table is read once or twice instead of once per dword. Planned
+        // (flattened) dwords, key reads and bound buffers keep the per-dword path.
+        private bool TryEmitScalarDeviceRange(Gen5ShaderInstruction instruction, Gen5ScalarMemoryControl control, uint dynamicOffset)
+        {
+            var request = _request;
+            var count = instruction.Destinations.Count;
+            if (count < 2 || count > 16 || instruction.Sources.Count == 0 || instruction.Sources[0].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                return false;
+            }
+
+            var path = -1;
+            for (var component = 0; component < count; component++)
+            {
+                if (instruction.Destinations[component].Kind != Gen5OperandKind.ScalarRegister ||
+                    !request.Memory.TryGetIndex(instruction.Pc, (uint)component, out var memoryIndex))
+                {
+                    return false;
+                }
+
+                var entry = request.Memory[memoryIndex];
+                if (entry.PlanningOnly || request.IndirectOffsetKeyMemoryIndices.Contains(memoryIndex) ||
+                    _indirectKeyScratch.ContainsKey(memoryIndex))
+                {
+                    return false;
+                }
+
+                // 0: a device descriptor, 1: a runtime SRT V#, 2: a scalar address.
+                var entryPath = entry.Kind == MemoryResourceKind.ScalarBuffer
+                    ? entry.DeviceDescriptor ? 0 : entry.Resource == MemoryAccessInfo.NoResource ? 1 : -1
+                    : entry.Kind == MemoryResourceKind.ScalarAddress ? 2 : -1;
+                if (entryPath < 0 || (component > 0 && entryPath != path))
+                {
+                    return false;
+                }
+
+                path = entryPath;
+            }
+
+            var baseRegister = instruction.Sources[0].Value;
+            var byteOffset = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes)));
+            uint[] values;
+            if (path == 0)
+            {
+                var (baseAddress, size, _, _) = LoadDeviceBufferDescriptor(baseRegister);
+                values = LoadDeviceBufferWords(baseAddress, size, byteOffset, count);
+            }
+            else if (path == 1)
+            {
+                // As the per-dword path: bounded by the V#'s stride and record count.
+                var descriptorWord1 = LoadS(baseRegister + 1);
+                var stride = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(16)), UInt(0x3FFF));
+                var records = LoadS(baseRegister + 2);
+                var size = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, stride, UInt(0)),
+                    records,
+                    _module.AddInstruction(SpirvOp.IMul, _uintType, stride, records));
+                var baseAddress = Pair64(LoadS(baseRegister), BitwiseAnd(descriptorWord1, UInt(0xFFFF)));
+                var address = And64(IAdd64(baseAddress, Widen(byteOffset)), ULong(DeviceAddressMask & ~3ul));
+                var allowed = new uint[count];
+                for (var component = 0; component < count; component++)
+                {
+                    var componentOffset = component == 0 ? byteOffset : IAdd(byteOffset, UInt((uint)component * sizeof(uint)));
+                    allowed[component] = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        ShiftRightLogical(componentOffset, UInt(2)),
+                        ShiftRightLogical(size, UInt(2)));
+                }
+
+                values = LoadDeviceDwordRange(address, allowed);
+            }
+            else
+            {
+                var address = IAdd64(
+                    Pair64(LoadS(baseRegister), LoadS(baseRegister + 1)),
+                    IAdd64(Widen(dynamicOffset), SignedOffset64(control.ImmediateOffsetBytes)));
+                var allowed = Enumerable.Repeat(_module.ConstantBool(true), count).ToArray();
+                values = LoadDeviceDwordRange(And64(address, ULong(DeviceAddressMask & ~3ul)), allowed);
+            }
+
+            for (var component = 0; component < count; component++)
+            {
+                StoreS(instruction.Destinations[component].Value, values[component]);
             }
 
             return true;
@@ -1274,23 +1584,49 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode.StartsWith("ScratchStore", StringComparison.Ordinal))
             {
-                EmitExecConditional(() =>
+                if (!_compactMemoryAccess)
                 {
-                    if (TryGetSubdwordStoreInfo(instruction.Opcode, out var byteCount, out var sourceShift))
+                    EmitExecConditional(() =>
                     {
-                        StoreScratchBytes(address, LoadV(control.SourceVectorRegister), byteCount, sourceShift);
-                        return;
-                    }
+                        if (TryGetSubdwordStoreInfo(instruction.Opcode, out var byteCount, out var sourceShift))
+                        {
+                            StoreScratchBytes(address, LoadV(control.SourceVectorRegister), byteCount, sourceShift, 0);
+                            return;
+                        }
 
-                    for (uint index = 0; index < control.DwordCount; index++)
-                    {
-                        Store(
-                            ScratchPointer(address, index * sizeof(uint)),
-                            control.SourceIsScalar
-                                ? LoadS(control.SourceVectorRegister + index)
-                                : LoadV(control.SourceVectorRegister + index));
-                    }
-                });
+                        for (uint index = 0; index < control.DwordCount; index++)
+                        {
+                            Store(
+                                ScratchPointer(address, index * sizeof(uint)),
+                                control.SourceIsScalar
+                                    ? LoadS(control.SourceVectorRegister + index)
+                                    : LoadV(control.SourceVectorRegister + index));
+                        }
+                    });
+                    return true;
+                }
+
+                // Scratch is the invocation's own and its index wraps, so an inactive lane of a compact program may touch it:
+                // a store writes back the word it read, and a load's register write keeps the old value (StoreV). Neither
+                // needs a branch.
+                var active = _execKnownFull ? 0 : Load(_boolType, _exec);
+                if (TryGetSubdwordStoreInfo(instruction.Opcode, out var storeBytes, out var storeShift))
+                {
+                    StoreScratchBytes(address, LoadV(control.SourceVectorRegister), storeBytes, storeShift, active);
+                    return true;
+                }
+
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var pointer = ScratchPointer(address, index * sizeof(uint));
+                    var value = control.SourceIsScalar
+                        ? LoadS(control.SourceVectorRegister + index)
+                        : LoadV(control.SourceVectorRegister + index);
+                    Store(pointer, active == 0
+                        ? value
+                        : _module.AddInstruction(SpirvOp.Select, _uintType, active, value, Load(_uintType, pointer)));
+                }
+
                 return true;
             }
 
@@ -1300,30 +1636,57 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            EmitExecConditional(() =>
+            if (!_compactMemoryAccess)
             {
-                if (TryGetSubdwordLoadInfo(instruction.Opcode, out var byteCount, out var signExtend, out var d16, out var d16High))
+                EmitExecConditional(() =>
                 {
-                    var destination = control.DestinationVectorRegister;
-                    var value = LoadScratchBytes(address, byteCount, signExtend);
-                    if (d16)
+                    if (TryGetSubdwordLoadInfo(instruction.Opcode, out var byteCount, out var signExtend, out var d16, out var d16High))
                     {
-                        value = d16High
-                            ? BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0x0000_FFFF)), ShiftLeftLogical(BitwiseAnd(value, UInt(0xFFFF)), UInt(16)))
-                            : BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)), BitwiseAnd(value, UInt(0xFFFF)));
+                        var destination = control.DestinationVectorRegister;
+                        var value = LoadScratchBytes(address, byteCount, signExtend);
+                        if (d16)
+                        {
+                            value = d16High
+                                ? BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0x0000_FFFF)), ShiftLeftLogical(BitwiseAnd(value, UInt(0xFFFF)), UInt(16)))
+                                : BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)), BitwiseAnd(value, UInt(0xFFFF)));
+                        }
+
+                        StoreV(destination, value);
+                        return;
                     }
 
-                    StoreV(destination, value);
-                    return;
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        StoreV(
+                            control.DestinationVectorRegister + index,
+                            Load(_uintType, ScratchPointer(address, index * sizeof(uint))));
+                    }
+                });
+                return true;
+            }
+
+            if (TryGetSubdwordLoadInfo(instruction.Opcode, out var loadBytes, out var loadSignExtend, out var loadD16, out var loadD16High))
+            {
+                var destination = control.DestinationVectorRegister;
+                var value = LoadScratchBytes(address, loadBytes, loadSignExtend);
+                if (loadD16)
+                {
+                    value = loadD16High
+                        ? BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0x0000_FFFF)), ShiftLeftLogical(BitwiseAnd(value, UInt(0xFFFF)), UInt(16)))
+                        : BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)), BitwiseAnd(value, UInt(0xFFFF)));
                 }
 
-                for (uint index = 0; index < control.DwordCount; index++)
-                {
-                    StoreV(
-                        control.DestinationVectorRegister + index,
-                        Load(_uintType, ScratchPointer(address, index * sizeof(uint))));
-                }
-            });
+                StoreV(destination, value);
+                return true;
+            }
+
+            for (uint index = 0; index < control.DwordCount; index++)
+            {
+                StoreV(
+                    control.DestinationVectorRegister + index,
+                    Load(_uintType, ScratchPointer(address, index * sizeof(uint))));
+            }
+
             return true;
         }
 
@@ -1332,15 +1695,15 @@ public static partial class Gen5SpirvTranslator
             var address = offsetBytes == 0
                 ? byteAddress
                 : IAdd(byteAddress, UInt(offsetBytes));
-            var dwordIndex = ShiftRightLogical(address, UInt(2));
-            if (_scratchDwordCount > 1)
-            {
-                dwordIndex = _module.AddInstruction(
+            // The index wraps, so even an inactive lane's address stays in the array; a compact program's single scratch
+            // dword is element 0.
+            var dwordIndex = _scratchDwordCount > 1
+                ? _module.AddInstruction(
                     SpirvOp.UMod,
                     _uintType,
-                    dwordIndex,
-                    UInt(_scratchDwordCount));
-            }
+                    ShiftRightLogical(address, UInt(2)),
+                    UInt(_scratchDwordCount))
+                : _compactMemoryAccess ? UInt(0) : ShiftRightLogical(address, UInt(2));
 
             return _module.AddInstruction(
                 SpirvOp.AccessChain,
@@ -1370,7 +1733,8 @@ public static partial class Gen5SpirvTranslator
             return value;
         }
 
-        private void StoreScratchBytes(uint byteAddress, uint value, uint byteCount, uint sourceShift)
+        // active is 0 when every lane stores; otherwise an inactive lane writes back the word it read.
+        private void StoreScratchBytes(uint byteAddress, uint value, uint byteCount, uint sourceShift, uint active)
         {
             if (sourceShift != 0)
             {
@@ -1381,12 +1745,13 @@ public static partial class Gen5SpirvTranslator
             var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
             var elementMask = UInt(byteCount == 1 ? 0xFFu : 0xFFFFu);
             var shiftedMask = ShiftLeftLogical(elementMask, shift);
+            var old = Load(_uintType, pointer);
             var merged = BitwiseOr(
                 BitwiseAnd(
-                    Load(_uintType, pointer),
+                    old,
                     _module.AddInstruction(SpirvOp.Not, _uintType, shiftedMask)),
                 ShiftLeftLogical(BitwiseAnd(value, elementMask), shift));
-            Store(pointer, merged);
+            Store(pointer, active == 0 ? merged : _module.AddInstruction(SpirvOp.Select, _uintType, active, merged, old));
         }
 
         // ---- buffers ----
@@ -1553,6 +1918,11 @@ public static partial class Gen5SpirvTranslator
         private uint LoadBoundedDeviceDword(uint address64, uint inRange)
         {
             var (pointer, valid) = ResolveDeviceAddress(address64);
+            if (_compactMemoryAccess)
+            {
+                return LoadMappedDeviceDword(pointer, LogicalAnd(inRange, valid));
+            }
+
             Store(_deviceWordScratch, UInt(0));
             EmitConditional(LogicalAnd(inRange, valid), () =>
                 Store(

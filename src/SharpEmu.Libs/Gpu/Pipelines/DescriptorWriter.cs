@@ -29,7 +29,7 @@ public static class DescriptorWriter
             DescriptorBindingKind.Samplers => Silk.NET.Vulkan.DescriptorType.Sampler,
             DescriptorBindingKind.Buffers or DescriptorBindingKind.GlobalDataShare or DescriptorBindingKind.DeviceAddressPageTable or
                 DescriptorBindingKind.FaultBuffer or DescriptorBindingKind.FlattenedResourceTable or DescriptorBindingKind.ShaderData or
-                DescriptorBindingKind.MipStatistics =>
+                DescriptorBindingKind.MipStatistics or DescriptorBindingKind.DeviceAddressFallback =>
                 Silk.NET.Vulkan.DescriptorType.StorageBuffer,
             _ => throw SubmissionScheduler.Fatal($"The descriptor binding kind is invalid: kind={kind}."),
         };

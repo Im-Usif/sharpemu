@@ -187,6 +187,8 @@ public sealed class ShaderResourcePlan
         plan.CallRecords = tracked.CallRecords;
         if (program.Instructions.Any(instruction => instruction.Control is ShaderCallFaultControl))
             plan.Info.UsesDeviceAddresses = true;
+        if (plan.Info.UsesDeviceAddresses && Gen5ShaderCallLinker.IsLinked(program))
+            plan.Info.UsesDeviceAddressFallback = true;
         if (callMarks && program.Instructions.Any(static instruction => instruction.Control is ShaderCallFaultControl { ReturnPc: not null }))
             plan.Info.UsesCallMarks = true;
         plan.IndirectImages = tracked.IndirectImages;
