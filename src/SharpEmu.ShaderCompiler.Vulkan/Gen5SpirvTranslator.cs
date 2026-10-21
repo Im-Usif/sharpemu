@@ -3664,6 +3664,25 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (FormatD16Components(instruction.Opcode) is var storedHalves and not 0 &&
+                instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal))
+            {
+                if (descriptorFormat == 0)
+                {
+                    return true;
+                }
+
+                if (!Gfx10UnifiedFormat.TryDecode(descriptorFormat, out _, out var storedNumberFormat))
+                {
+                    error = $"unsupported buffer store format {descriptorFormat}";
+                    return false;
+                }
+
+                EmitExecConditional(() => TryEmitBufferFormatStore(bindingIndex, byteAddress, control, descriptorWord3, descriptorFormat,
+                    storedHalves, component => LoadBufferD16Component(control.VectorData, component, storedNumberFormat)));
+                return true;
+            }
+
             if (instruction.Opcode is "BufferStoreFormatX" or "BufferStoreFormatXy" or
                 "BufferStoreFormatXyz" or "BufferStoreFormatXyzw")
             {
@@ -3751,6 +3770,15 @@ public static partial class Gen5SpirvTranslator
             {
                 error = $"unsupported buffer opcode {instruction.Opcode}";
                 return false;
+            }
+
+            if (FormatD16Components(instruction.Opcode) is var loadedHalves and not 0 && !control.Typed)
+            {
+                var (_, loadedNumberFormat) = DecodeGfx10BufferFormat(
+                    BitwiseAnd(ShiftRightLogical(descriptorWord3, UInt(12)), UInt(0x7F)));
+                StoreBufferD16Components(control.VectorData,
+                    BufferFormatLoadValues(bindingIndex, byteAddress, descriptorWord3, loadedHalves), loadedNumberFormat);
+                return true;
             }
 
             // A typed load converts with the instruction format, a formatted untyped load
@@ -3924,6 +3952,21 @@ public static partial class Gen5SpirvTranslator
             var byteAddress = IAdd(UInt(unchecked((uint)control.OffsetBytes)), scalarOffset);
             byteAddress = IAdd(byteAddress, vectorOffset);
             byteAddress = IAdd(byteAddress, _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
+
+            if (FormatD16Components(instruction.Opcode) is var deviceHalves and not 0)
+            {
+                if (!instruction.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal))
+                {
+                    error = $"device buffer descriptor operation {instruction.Opcode} is not supported";
+                    return false;
+                }
+
+                var (_, deviceNumberFormat) = DecodeGfx10BufferFormat(
+                    BitwiseAnd(ShiftRightLogical(descriptorWord3, UInt(12)), UInt(0x7F)));
+                StoreBufferD16Components(control.VectorData,
+                    DeviceBufferFormatLoadValues(baseAddress, size, byteAddress, descriptorWord3, deviceHalves), deviceNumberFormat);
+                return true;
+            }
 
             if (IsFormatBufferLoad(instruction.Opcode))
             {
@@ -4127,6 +4170,20 @@ public static partial class Gen5SpirvTranslator
             uint vectorData,
             uint componentCount)
         {
+            DeviceBufferFormatLoadValues(baseAddress, size, byteAddress, descriptorWord3, componentCount,
+                (destination, value) => StoreV(vectorData + destination, value));
+        }
+
+        // The destination registers of a formatted load through a device-address V#; store, when given, writes each one as
+        // soon as it is known.
+        private uint[] DeviceBufferFormatLoadValues(
+            uint baseAddress,
+            uint size,
+            uint byteAddress,
+            uint descriptorWord3,
+            uint componentCount,
+            Action<uint, uint>? store = null)
+        {
             var unifiedFormat = BitwiseAnd(
                 ShiftRightLogical(descriptorWord3, UInt(12)),
                 UInt(0x7F));
@@ -4169,6 +4226,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var one = Gfx10FormatOne(numberFormat);
+            var values = new uint[componentCount];
             for (uint destination = 0; destination < componentCount; destination++)
             {
                 var selector = selectors[destination];
@@ -4178,10 +4236,11 @@ public static partial class Gen5SpirvTranslator
                 value = SelectUInt(selector, 5, canonical[1], value);
                 value = SelectUInt(selector, 6, canonical[2], value);
                 value = SelectUInt(selector, 7, canonical[3], value);
-                StoreV(
-                    vectorData + destination,
-                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant));
+                values[destination] = _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant);
+                store?.Invoke(destination, values[destination]);
             }
+
+            return values;
         }
 
         private uint LoadGfx10DeviceBufferFormatComponent(
@@ -4250,6 +4309,19 @@ public static partial class Gen5SpirvTranslator
             uint vectorData,
             uint componentCount)
         {
+            BufferFormatLoadValues(bindingIndex, byteAddress, descriptorWord3, componentCount,
+                (destination, value) => StoreV(vectorData + destination, value));
+        }
+
+        // The destination registers of a formatted untyped load, converted with the descriptor format and swizzle; store,
+        // when given, writes each one as soon as it is known.
+        private uint[] BufferFormatLoadValues(
+            int bindingIndex,
+            uint byteAddress,
+            uint descriptorWord3,
+            uint componentCount,
+            Action<uint, uint>? store = null)
+        {
             var unifiedFormat = BitwiseAnd(
                 ShiftRightLogical(descriptorWord3, UInt(12)),
                 UInt(0x7F));
@@ -4289,6 +4361,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var one = Gfx10FormatOne(numberFormat);
+            var values = new uint[componentCount];
             for (uint destination = 0; destination < componentCount; destination++)
             {
                 var selector = selectors[destination];
@@ -4298,10 +4371,56 @@ public static partial class Gen5SpirvTranslator
                 value = SelectUInt(selector, 5, canonical[1], value);
                 value = SelectUInt(selector, 6, canonical[2], value);
                 value = SelectUInt(selector, 7, canonical[3], value);
-                StoreV(
-                    vectorData + destination,
-                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant));
+                values[destination] = _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant);
+                store?.Invoke(destination, values[destination]);
             }
+
+            return values;
+        }
+
+        // The components a D16 format operation transfers (X to XYZW), or 0 for any other operation.
+        private static uint FormatD16Components(string opcode) => opcode switch
+        {
+            "BufferLoadFormatD16X" or "BufferStoreFormatD16X" => 1u,
+            "BufferLoadFormatD16Xy" or "BufferStoreFormatD16Xy" => 2u,
+            "BufferLoadFormatD16Xyz" or "BufferStoreFormatD16Xyz" => 3u,
+            "BufferLoadFormatD16Xyzw" or "BufferStoreFormatD16Xyzw" => 4u,
+            _ => 0u,
+        };
+
+        // A D16 load returns its components as 16-bit values, two to a register with the first in the low half: halves for
+        // the float and normalized formats, the low 16 bits for UINT and SINT (number formats 4 and 5). An odd last
+        // component leaves the high half zero.
+        private void StoreBufferD16Components(uint vectorData, uint[] values, uint numberFormat)
+        {
+            var integer = _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(4)),
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(5)));
+            for (var index = 0; index < values.Length; index += 2)
+            {
+                var low = values[index];
+                var high = index + 1 < values.Length ? values[index + 1] : UInt(0);
+                var halves = Ext(58, _uintType, _module.AddInstruction(SpirvOp.CompositeConstruct, _vec2Type,
+                    Bitcast(_floatType, low), Bitcast(_floatType, high)));
+                var integers = BitwiseOr(BitwiseAnd(low, UInt(0xFFFF)), ShiftLeftLogical(BitwiseAnd(high, UInt(0xFFFF)), UInt(16)));
+                StoreV(vectorData + (uint)(index / 2), _module.AddInstruction(SpirvOp.Select, _uintType, integer, integers, halves));
+            }
+        }
+
+        // The 32-bit register value one component of a D16 store stands for: its half widened to a float for the float and
+        // normalized formats, its 16 bits (sign-extended for SINT) for the integer ones.
+        private uint LoadBufferD16Component(uint vectorData, uint component, uint numberFormat)
+        {
+            var packed = LoadV(vectorData + component / 2);
+            if (numberFormat is not (4 or 5))
+            {
+                return Bitcast(_uintType, _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, Ext(62, _vec2Type, packed), component & 1));
+            }
+
+            var half = BitwiseAnd(ShiftRightLogical(packed, UInt((component & 1) * 16)), UInt(0xFFFF));
+            return numberFormat == 4
+                ? half
+                : Bitcast(_uintType, _module.AddInstruction(SpirvOp.BitFieldSExtract, _intType, Bitcast(_intType, half), UInt(0), UInt(16)));
         }
 
         // Check the first and last dwords of the required range together.
@@ -4370,14 +4489,18 @@ public static partial class Gen5SpirvTranslator
             uint byteAddress,
             Gen5BufferMemoryControl control,
             uint descriptorWord3,
-            uint unifiedFormat)
+            uint unifiedFormat,
+            uint components = 0,
+            Func<uint, uint>? componentValue = null)
         {
             if (!Gfx10UnifiedFormat.TryDecode(unifiedFormat, out var dataFormat, out var numberFormat))
             {
                 return false;
             }
 
-            var componentCount = Math.Min(control.DwordCount, Gfx10UnifiedFormat.ComponentCount(dataFormat));
+            // A D16 store passes its component count and unpacks each component's register value (LoadBufferD16Component).
+            componentValue ??= component => LoadV(control.VectorData + component);
+            var componentCount = Math.Min(components != 0 ? components : control.DwordCount, Gfx10UnifiedFormat.ComponentCount(dataFormat));
             if (componentCount == 0)
             {
                 return false;
@@ -4401,7 +4524,7 @@ public static partial class Gen5SpirvTranslator
                         StoreBufferWord(
                             bindingIndex,
                             byteOffset == 0 ? dwordAddress : IAdd(dwordAddress, UInt(byteOffset / 4)),
-                            LoadV(control.VectorData + component));
+                            componentValue(component));
                     }
 
                     return;
@@ -4417,7 +4540,7 @@ public static partial class Gen5SpirvTranslator
                 {
                     Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out var bitOffset, out var bitCount);
                     var encoded = EncodeGfx10BufferComponent(
-                        LoadV(control.VectorData + component),
+                        componentValue(component),
                         bitCount,
                         numberFormat,
                         dataFormat);
