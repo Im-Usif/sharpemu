@@ -210,6 +210,11 @@ internal static unsafe partial class VulkanVideoPresenter
             CompleteOverlappingPublications(address, size);
         }
 
+        public string DescribeCleanRead(ulong address) =>
+            $"readable={_guestMemory.CanRead(address, sizeof(uint))} gpu_dirty_bytes={_bufferCache.HasGpuDirtyBytes(address, sizeof(uint))} " +
+            $"gpu_dirty_pages={_bufferCache.HasGpuDirtyPages(address, sizeof(uint))} image_modified={_imageCache.HasGpuModifiedImageBytes(address, sizeof(uint))} " +
+            $"pending_publication={HasPendingMemoryPublication(address, sizeof(uint))} buffer={_bufferCache.IsRegionRegistered(address, sizeof(uint))}";
+
         // Refused while a GPU buffer or image write may still own the range.
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {

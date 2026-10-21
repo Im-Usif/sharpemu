@@ -103,6 +103,9 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
+    // For an error report: why a clean read of the dword can fail (mapping and GPU ownership).
+    string DescribeCleanRead(ulong address) => "";
+
     // Copies guest bytes the CPU already holds, without synchronizing. False when the GPU
     // may own the range (or, for a clean read, when a clean word read would be refused);
     // the resource cache then re-materializes instead of trusting a stale copy.

@@ -86,7 +86,19 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
         return true;
     }
 
-    public bool TryReadCleanGuestWord(ulong address, out uint word) => TryReadGuestWord(address, out word);
+    // Addresses whose clean reads are refused, as for bytes a GPU image or buffer may still own.
+    public Func<ulong, bool>? RefuseCleanRead { get; set; }
+
+    public bool TryReadCleanGuestWord(ulong address, out uint word)
+    {
+        if (RefuseCleanRead?.Invoke(address) == true)
+        {
+            word = 0;
+            return false;
+        }
+
+        return TryReadGuestWord(address, out word);
+    }
 
     public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
     {
