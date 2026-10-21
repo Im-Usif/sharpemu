@@ -47,6 +47,15 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
     public bool GraphicsSubgroupOperationsEnabled => true;
 
     public bool SharedInt64AtomicsEnabled => false;
+
+    public bool CallMarksSupported { get; set; }
+
+    public long CallMarkSnapshots { get; set; }
+
+    public Dictionary<uint, long> MarkedBits { get; } = [];
+
+    public long CallMarkedAt(uint bit) => MarkedBits.GetValueOrDefault(bit);
+
     public bool ImageInt64AtomicsEnabled { get; set; }
     public bool MeshShadersSupported { get; set; }
 
