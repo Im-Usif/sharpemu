@@ -184,6 +184,16 @@ public sealed class ShaderResourceInfo
     public bool HasBitwiseExclusiveOr { get; set; }
     public bool UsesDeviceAddresses { get; set; }
 
+    // Some image access reads its image or sampler from a bindless heap through descriptor set 1.
+    public bool UsesBindlessHeap { get; set; }
+
+    // Some image access reads its image or sampler through a linked callee's record argument (see CallRecordSelector).
+    public bool UsesCallRecords { get; set; }
+
+    // A call that reaches a callee the program does not hold marks it (CallMarks).
+    public bool UsesCallMarks { get; set; }
+
+
     public ShaderResourceInfo Clone() => new()
     {
         Buffers = Buffers.Select(buffer => buffer.Clone()).ToList(),
@@ -200,6 +210,9 @@ public sealed class ShaderResourceInfo
         InstanceOffsetScalarRegister = InstanceOffsetScalarRegister,
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
+        UsesBindlessHeap = UsesBindlessHeap,
+        UsesCallRecords = UsesCallRecords,
+        UsesCallMarks = UsesCallMarks,
     };
 }
 
@@ -241,6 +254,7 @@ public sealed class DescriptorSource
     public ScalarValue[] Dwords { get; init; } = [];
     public uint DwordCount => (uint)Dwords.Length;
     public IndirectImageSelector? IndirectImage { get; init; }
+    public CallRecordSelector? CallRecord { get; init; }
 }
 
 // One immediate-offset scalar read the host evaluates into the flattened table.
