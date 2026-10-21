@@ -1208,6 +1208,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
 
+        // The compile in flight for each linked guest program (Bindings.CallTargetCount != 0), by program hash.
+        private readonly Dictionary<ulong, Task> _linkedComputeCompiles = new();
+
         public Task? GetComputePipelineCompletion(ShaderProgram program) =>
             _pendingComputePipelines.TryGetValue(program.Id, out var pending) ? pending.Compile : null;
         private static readonly SemaphoreSlim _computeCompileSlots =
@@ -1261,6 +1264,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     ProfileComputeHash = pending.Hash,
                 }, () => _pendingComputePipelines.Remove(key));
                 return true;
+            }
+
+            // A linked program's module can keep the driver busy for minutes, and a game that streams callees relinks
+            // the program before an earlier module is done. Each linked program compiles one module at a time, so the
+            // modules of tables the game has already replaced cannot take every compiler slot from the programs its
+            // queues wait for.
+            var linked = description.Stage.Bindings is { CallTargetCount: not 0 };
+            if (linked && _linkedComputeCompiles.TryGetValue(description.Stage.Hash, out var running) && !running.IsCompleted)
+            {
+                return false;
             }
 
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
@@ -1326,6 +1339,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
             _pendingComputePipelines.Add(key, started);
+            if (linked)
+            {
+                _linkedComputeCompiles[description.Stage.Hash] = started.Compile;
+            }
+
             return false;
         }
 
@@ -1392,6 +1410,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _vk.DestroyDescriptorSetLayout(_device, pending.SetLayout, null);
             }
             _pendingComputePipelines.Clear();
+            _linkedComputeCompiles.Clear();
         }
 
         private void DestroyRenderPipelines()
