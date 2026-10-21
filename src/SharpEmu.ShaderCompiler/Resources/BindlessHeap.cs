@@ -21,7 +21,7 @@ public static class BindlessHeap
     public const uint CallRecordKeyWords = 3;
 
     // The lookup reaches this many rows; the host gives a dispatch no more.
-    public const uint CallRecordMaximumRows = 8191;
+    public const uint CallRecordMaximumRows = 32767;
 
     // The buffer holds at least this many words, so the lookup of an empty table reads inside it.
     public const uint CallRecordMinimumWords = 8;
