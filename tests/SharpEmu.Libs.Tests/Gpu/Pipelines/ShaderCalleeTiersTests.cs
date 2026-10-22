@@ -90,8 +90,8 @@ public sealed class ShaderCalleeTiersTests
         Assert.Equal(11, tiers.LinkedGeneration);
     }
 
-    // The first program holds exactly the callees an earlier session kept, whose pipeline the linked cache holds; the same
-    // code the game loaded at another address this session joins the next choice, once that program is ready.
+    // The first program holds exactly the callees an earlier session kept, whose pipeline the linked cache holds. The same
+    // code at another address joins a choice only once a dispatch finds that copy unserved: a moved copy needs no new program.
     [Fact]
     public void The_first_choice_is_the_kept_program()
     {
@@ -100,7 +100,9 @@ public sealed class ShaderCalleeTiersTests
         Assert.Equal([First], tiers.Choose(union, fallbackGeneration: -1, snapshots: 0)[0x40].Keys);
         tiers.LinkedGeneration = 10;
         Assert.Equal([First], tiers.Choose(union, fallbackGeneration: 9, snapshots: 1)[0x40].Keys);
-        Assert.Equal([First, Second], tiers.Choose(union, fallbackGeneration: 10, snapshots: 2)[0x40].Keys.Order());
+        Assert.Equal([First], tiers.Choose(union, fallbackGeneration: 10, snapshots: 20)[0x40].Keys);
+        tiers.NoteUnservedCopy(snapshots: 21);
+        Assert.Equal([First, Second], tiers.Choose(union, fallbackGeneration: 10, snapshots: 22)[0x40].Keys.Order());
     }
 
     // Callees that become called over a few frames join one choice: a new choice waits until no callee has become called for

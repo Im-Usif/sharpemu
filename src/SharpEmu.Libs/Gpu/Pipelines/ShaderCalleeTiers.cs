@@ -81,14 +81,25 @@ internal sealed class ShaderCalleeTiers
         return added;
     }
 
+    // A dispatch named the code of a chosen callee at an address no slot of the program serves (the game holds more copies of
+    // that code than the program has slots): the next choice adds the copy, as it adds a callee that became called.
+    public void NoteUnservedCopy(long snapshots)
+    {
+        if (_firstUnchosen < 0)
+        {
+            _firstUnchosen = snapshots;
+        }
+    }
+
     // The callees each site links: the union's called callees, chosen again once the program of the last choice is ready
-    // (fallbackGeneration, the generation of the caller's ready program, reaches its generation) and the calls have settled
-    // (snapshots, the host's mark snapshot count).
+    // (fallbackGeneration, the generation of the caller's ready program, reaches its generation), a callee became called or a
+    // copy went unserved since that choice, and the calls have settled (snapshots, the host's mark snapshot count). A copy
+    // the game moved needs no new program: a slot serves the address that now holds its code.
     public IReadOnlyDictionary<uint, Dictionary<ulong, UnitedCallee>> Choose(Dictionary<uint, Dictionary<ulong, UnitedCallee>> union,
         long fallbackGeneration, long snapshots)
     {
-        if (_chosen is not null && (LinkedGeneration is not { } generation || fallbackGeneration < generation ||
-            _firstUnchosen >= 0 && snapshots - _lastCalled < Settle && snapshots - _firstUnchosen < MaxSettle))
+        if (_chosen is not null && (LinkedGeneration is not { } generation || fallbackGeneration < generation || _firstUnchosen < 0 ||
+            snapshots - _lastCalled < Settle && snapshots - _firstUnchosen < MaxSettle))
         {
             return _chosen;
         }

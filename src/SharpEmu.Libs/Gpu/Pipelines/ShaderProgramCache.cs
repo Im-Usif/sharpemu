@@ -514,7 +514,11 @@ internal sealed class ShaderProgramCache
                 callArguments = library.Arguments;
                 if (linked.RuntimeCallRecords)
                 {
-                    (callTargets, callRecords) = CurrentTargets(linked, library);
+                    (callTargets, callRecords, var unservedCopy) = CurrentTargets(linked, library);
+                    if (unservedCopy && runtimeFallback is null && _calleeTiers.TryGetValue(key!, out var unservedTiers))
+                    {
+                        unservedTiers.NoteUnservedCopy(_host.CallMarkSnapshots);
+                    }
                 }
                 else
                 {
@@ -775,8 +779,8 @@ internal sealed class ShaderProgramCache
     // the address it was linked with while that address holds the code linked for it, else an address the tables name with
     // that code at one of the slot's sites (the game loaded the function elsewhere, as it does in another session), else none
     // (ulong.MaxValue matches no call). A record no slot serves returns at once and never runs the code that used to be at
-    // its address.
-    private static (ulong[] Targets, (ulong Target, ulong Argument)[] Records) CurrentTargets(ProgramSourceEntry program,
+    // its address. UnservedCopy is whether the tables name code the program holds at an address no slot serves.
+    private static (ulong[] Targets, (ulong Target, ulong Argument)[] Records, bool UnservedCopy) CurrentTargets(ProgramSourceEntry program,
         ShaderCallLibrary library)
     {
         const ulong NoTarget = ulong.MaxValue;
@@ -852,7 +856,10 @@ internal sealed class ShaderProgramCache
             }
         }
 
-        return (targets, [.. library.Records.Where(record => served.Contains(record.Target))]);
+        var codes = program.CallTargetCodes.Select(Convert.ToHexString).ToHashSet();
+        var unservedCopy = library.CurrentCodeHashes.Any(named =>
+            !served.Contains(named.Key) && codes.Contains(Convert.ToHexString(named.Value)));
+        return (targets, [.. library.Records.Where(record => served.Contains(record.Target))], unservedCopy);
     }
 
     // A caller whose callees cannot read their records at run time skips this dispatch and links a copy per record next.
