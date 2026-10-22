@@ -78,6 +78,7 @@ public static partial class Gen5SpirvTranslator
         private readonly bool _hasIndirectControlFlow;
         private readonly Dictionary<uint, Dictionary<uint, uint>> _savedLaneValues = new();
         private readonly bool _usesBufferAtomics;
+        private readonly bool _usesCoherentBufferPairs;
 
         // Safety valve for the PC-dispatcher loop. Each iteration executes one
         // GCN basic block; a correctly-translated shader always reaches its
@@ -176,9 +177,12 @@ public static partial class Gen5SpirvTranslator
         // (VGPR, lane).
         private readonly Dictionary<(uint Register, uint Lane), uint> _laneSpillSlots = new();
         private uint _globalBuffers;
+        private uint _globalBufferPairs;
         private uint _gfx10BufferFormatTable;
         private uint _storageBlockPointer;
+        private uint _storagePairBlockPointer;
         private uint _storageUintPointer;
+        private uint _storageUvec2Pointer;
         private uint _lds;
         private bool _ldsPrivate;
         private uint _ldsElementPointer;
@@ -3810,6 +3814,12 @@ public static partial class Gen5SpirvTranslator
                         return;
                     }
 
+                    if (instruction.Opcode == "BufferStoreDwordx2" && control.Glc && _globalBufferPairs != 0)
+                    {
+                        StoreBufferPair(bindingIndex, dwordAddress, LoadV(control.VectorData), LoadV(control.VectorData + 1));
+                        return;
+                    }
+
                     // BUFFER_STORE/LOAD_DWORD(x2/x3/x4) are dword-aligned by the GCN ISA, same as the GLOBAL case above — no per-byte reassembly needed.
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
@@ -3884,6 +3894,12 @@ public static partial class Gen5SpirvTranslator
                 {
                     return true;
                 }
+            }
+
+            if (instruction.Opcode == "BufferLoadDwordx2" && control.Glc && _globalBufferPairs != 0)
+            {
+                LoadBufferPair(bindingIndex, dwordAddress, control.VectorData);
+                return true;
             }
 
             for (uint index = 0; index < control.DwordCount; index++)
@@ -8468,6 +8484,62 @@ public static partial class Gen5SpirvTranslator
                 IsBufferWordInRange(binding, dwordAddress),
                 () => Store(BufferWordPointer(binding, dwordAddress), value));
         }
+
+        // A GLC DWORDX2 access: one 64-bit access when it is aligned and inside the pair view, else two dword accesses.
+        private void LoadBufferPair(int binding, uint dwordAddress, uint register)
+        {
+            var pairIndex = ShiftRightLogical(dwordAddress, UInt(1));
+            EmitConditional(
+                IsBufferPairInRange(binding, dwordAddress, pairIndex),
+                () =>
+                {
+                    var pair = Load(_uvec2Type, BufferPairPointer(binding, pairIndex));
+                    StoreV(register, _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, pair, 0));
+                    StoreV(register + 1, _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, pair, 1));
+                },
+                () =>
+                {
+                    StoreV(register, LoadBufferWord(binding, dwordAddress));
+                    StoreV(register + 1, LoadBufferWord(binding, IAdd(dwordAddress, UInt(1))));
+                });
+        }
+
+        private void StoreBufferPair(int binding, uint dwordAddress, uint low, uint high)
+        {
+            var pairIndex = ShiftRightLogical(dwordAddress, UInt(1));
+            EmitConditional(
+                IsBufferPairInRange(binding, dwordAddress, pairIndex),
+                () => Store(
+                    BufferPairPointer(binding, pairIndex),
+                    _module.AddInstruction(SpirvOp.CompositeConstruct, _uvec2Type, low, high)),
+                () =>
+                {
+                    StoreBufferWord(binding, dwordAddress, low);
+                    StoreBufferWord(binding, IAdd(dwordAddress, UInt(1)), high);
+                });
+        }
+
+        private uint IsBufferPairInRange(int binding, uint dwordAddress, uint pairIndex)
+        {
+            var buffer = _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _storagePairBlockPointer,
+                _globalBufferPairs,
+                UInt((uint)binding));
+            var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, buffer, 0);
+            return LogicalAnd(
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, BitwiseAnd(dwordAddress, UInt(1)), UInt(0)),
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, pairIndex, length));
+        }
+
+        private uint BufferPairPointer(int binding, uint pairIndex) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _storageUvec2Pointer,
+                _globalBufferPairs,
+                UInt((uint)binding),
+                UInt(0),
+                pairIndex);
 
         private uint IsBufferWordInRange(int binding, uint dwordAddress)
         {

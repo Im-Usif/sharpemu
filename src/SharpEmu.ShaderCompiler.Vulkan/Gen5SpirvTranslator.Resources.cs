@@ -170,6 +170,9 @@ public static partial class Gen5SpirvTranslator
             _usesBufferAtomics = request.Program.Instructions.Any(static instruction =>
                 instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
                 instruction.Opcode.StartsWith("GlobalAtomic", StringComparison.Ordinal));
+            _usesCoherentBufferPairs = request.Program.Instructions.Any(static instruction =>
+                instruction.Opcode is "BufferLoadDwordx2" or "BufferStoreDwordx2" &&
+                instruction.Control is Gen5BufferMemoryControl { Glc: true });
             _stage = request.Stage switch
             {
                 ShaderStage.Vertex => Gen5SpirvStage.Vertex,
@@ -404,6 +407,37 @@ public static partial class Gen5SpirvTranslator
             }
 
             _interfaces.Add(_globalBuffers);
+            if (_usesCoherentBufferPairs)
+            {
+                DeclareBufferPairArray(count, bindingNumber);
+            }
+        }
+
+        // The same buffers as dword pairs. The GPU does an aligned DWORDX2 access as one 64-bit access, so a thread
+        // group polling another's {flag, value} pair with GLC loads never sees half of an update; two dword accesses can.
+        private void DeclareBufferPairArray(uint count, uint bindingNumber)
+        {
+            var runtimeArray = _module.TypeRuntimeArray(_uvec2Type);
+            _module.AddDecoration(runtimeArray, SpirvDecoration.ArrayStride, 2 * sizeof(uint));
+            var block = _module.TypeStruct(runtimeArray);
+            _module.AddDecoration(block, SpirvDecoration.Block);
+            _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
+            _storagePairBlockPointer = _module.TypePointer(SpirvStorageClass.StorageBuffer, block);
+            _storageUvec2Pointer = _module.TypePointer(SpirvStorageClass.StorageBuffer, _uvec2Type);
+            _globalBufferPairs = _module.AddGlobalVariable(
+                _module.TypePointer(SpirvStorageClass.StorageBuffer, _module.TypeArray(block, count)),
+                SpirvStorageClass.StorageBuffer);
+            _module.AddName(_globalBufferPairs, "guestBufferPairs");
+            _module.AddDecoration(_globalBufferPairs, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(_globalBufferPairs, SpirvDecoration.Binding, bindingNumber);
+            _module.AddDecoration(_globalBuffers, SpirvDecoration.Aliased);
+            _module.AddDecoration(_globalBufferPairs, SpirvDecoration.Aliased);
+            if (_usesBufferAtomics)
+            {
+                _module.AddDecoration(_globalBufferPairs, SpirvDecoration.Coherent);
+            }
+
+            _interfaces.Add(_globalBufferPairs);
         }
 
         // One storage block holding a runtime array of dwords.

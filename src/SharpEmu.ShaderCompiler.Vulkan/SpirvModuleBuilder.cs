@@ -272,6 +272,7 @@ public enum SpirvDecoration : uint
     DescriptorSet = 34,
     Offset = 35,
     NoContraction = 42,
+    Aliased = 20,
     Coherent = 23,
     NonWritable = 24,
     PerPrimitiveExt = 5271,
