@@ -90,6 +90,19 @@ public sealed class ShaderCalleeTiersTests
         Assert.Equal(11, tiers.LinkedGeneration);
     }
 
+    // The first program holds exactly the callees an earlier session kept, whose pipeline the linked cache holds; the same
+    // code the game loaded at another address this session joins the next choice, once that program is ready.
+    [Fact]
+    public void The_first_choice_is_the_kept_program()
+    {
+        var union = Union(Callee(First, FirstCode), Callee(Second, FirstCode));
+        var tiers = new ShaderCalleeTiers(Union(union[0x40][First]));
+        Assert.Equal([First], tiers.Choose(union, fallbackGeneration: -1, snapshots: 0)[0x40].Keys);
+        tiers.LinkedGeneration = 10;
+        Assert.Equal([First], tiers.Choose(union, fallbackGeneration: 9, snapshots: 1)[0x40].Keys);
+        Assert.Equal([First, Second], tiers.Choose(union, fallbackGeneration: 10, snapshots: 2)[0x40].Keys.Order());
+    }
+
     // Callees that become called over a few frames join one choice: a new choice waits until no callee has become called for
     // a few snapshots, and no longer than a bound after the first one the chosen program lacks.
     [Fact]

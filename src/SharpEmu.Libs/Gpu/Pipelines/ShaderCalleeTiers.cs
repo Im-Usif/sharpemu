@@ -29,9 +29,17 @@ internal sealed class ShaderCalleeTiers
     private long _lastCalled = -1;
     private long _firstUnchosen = -1;
 
-    // The callees an earlier session kept for the caller count as called.
-    public ShaderCalleeTiers(IReadOnlyDictionary<uint, Dictionary<ulong, UnitedCallee>> kept) =>
+    // The callees an earlier session kept for the caller count as called, and its first program holds exactly those, whose
+    // pipeline the linked cache holds. The union also names the other addresses the game loaded the same code at in this
+    // session, and a first program that held them too would be another compile of minutes.
+    public ShaderCalleeTiers(IReadOnlyDictionary<uint, Dictionary<ulong, UnitedCallee>> kept)
+    {
         _called = [.. kept.Values.SelectMany(static callees => callees.Values).Select(static callee => Convert.ToHexString(callee.Code))];
+        if (kept.Count != 0)
+        {
+            _chosen = kept.ToDictionary(static site => site.Key, static site => site.Value);
+        }
+    }
 
     public int Called => _called.Count;
 
